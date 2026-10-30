@@ -29,7 +29,7 @@ Grab the portable build from the [**Releases**](https://github.com/chenghaowan/p
 
 | File | Contents | Size |
 | --- | --- | --- |
-| `pointtofix-craft-portable.zip` | `pointtofix.exe` + `onnxruntime.dll` | ~36 MB |
+| `pointtofix-craft-portable.zip` | `pointtofix.exe` + `onnxruntime.dll` | ~13 MB (36 MB unpacked) |
 
 Unzip anywhere and double-click `pointtofix.exe`. No installer, no VC++ redistributable, no registry writes — the tool is a single statically linked executable. Settings live in `%APPDATA%\pointtofix\`.
 
