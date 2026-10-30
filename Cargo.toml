@@ -1,0 +1,44 @@
+[package]
+name = "pointtofix"
+version = "0.2.0"
+edition = "2021"
+description = "PointToFix — 屏幕标注工具(Rust 重写版,REA 练手项目)"
+
+[dependencies]
+eframe = "0.37"
+image = { version = "0.25", default-features = false, features = ["png"] }
+# 存图默认走 WebP:libwebp 同时提供有损(清晰度可调)与无损两种编码
+webp = "0.3"
+arboard = "3"
+# 与 eframe 依赖同一版本:用于从 CreationContext 取出 HWND(标注层按物理像素铺满虚拟屏)
+raw-window-handle = "0.6"
+# ISNet 去背:ONNX Runtime 运行 1024×1024 的 ISNet 只有 ~1.6 s,
+# 纯 Rust 运行时要 20 s,所以走 ORT。load-dynamic = 运行期加载 onnxruntime.dll,
+# 构建时不联网下载二进制;DLL 随便携包一起分发(见 build-portable.bat)
+ort = { version = "2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "ndarray",
+    "load-dynamic",
+    "api-17",
+] }
+windows = { version = "0.62", features = [
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Printing",
+    "Win32_Globalization",
+    "Win32_Storage_Xps",
+    "Win32_System_SystemInformation",
+] }
+
+[build-dependencies]
+# 把 assets/app.ico 编进 PE 资源(资源管理器/任务栏显示自定义图标)
+embed-resource = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
+
+# dev 构建也开一层优化:截图合成/去背/PNG/WebP 编码在未优化时慢到卡 UI
+[profile.dev]
+opt-level = 1

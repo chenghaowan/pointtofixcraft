@@ -1,0 +1,21 @@
+# Rust build output
+/target/
+
+# Local portable packages and screenshots
+/dist/
+/*.webp
+/*.png
+
+# ONNX Runtime + ISNet models are fetched locally, never committed
+/models/
+*.onnx
+onnxruntime*.dll
+
+# Personal cargo mirror configuration (see README.zh-CN.md)
+/.cargo/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
