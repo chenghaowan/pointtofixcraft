@@ -198,6 +198,8 @@ pub struct App {
     geom_log_frames: u32,
     /// 自检:进入标注模式 N 帧后自动触发去背(模拟点击 ⊠)
     selftest_countdown: u32,
+    /// 自检:POINTTOFIX_TEXTTEST=1 时,激活后 N 帧自动用文字工具打开编辑(验证文字输入/Esc 链路)
+    texttest_frames: u32,
     // 截图合成管线(DWM 透明窗口不在 BitBlt 里,需合入 egui 帧缓冲)
     shot_job: Option<ShotJob>,
     shot_phase: ShotPhase,
@@ -224,7 +226,8 @@ pub struct App {
 pub struct TextEditor {
     pos: Pos2,
     buf: String,
-    focused: bool,
+    /// 输入法组词中的临时文本(None = 不在组词;空串视为已取消)
+    preedit: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -301,6 +304,7 @@ impl App {
             autosave_frames: 0,
             autocopy_frames: 0,
             stamp_frames: 0,
+            texttest_frames: 0,
         }
     }
 
@@ -555,6 +559,11 @@ impl App {
             self.stamp_frames = 40;
             self.autosave_frames = 100;
         }
+        // 自检:POINTTOFIX_TEXTTEST=1 时,激活后约 5 秒自动用文字工具打开编辑
+        // (验证文字输入 / Esc 退出链路;输入与 Esc 由外部真实按键注入)
+        if std::env::var("POINTTOFIX_TEXTTEST").is_ok() {
+            self.texttest_frames = 300;
+        }
     }
 
     fn exit_active(&mut self, ctx: &Context) {
@@ -657,6 +666,15 @@ impl App {
 
     fn active_ui(&mut self, ctx: &Context) {
         let tr = self.lang.strings();
+        // 文字编辑:先处理本帧的字符/输入法/退格/回车事件,再响应鼠标点击
+        // (点击任意处都会提交;文字工具点到画布会在下方 begin_stroke 重新开编)
+        if self.text_edit.is_some() {
+            self.text_editor_input(ctx);
+        }
+        if ctx.input(|i| i.pointer.button_pressed(PointerButton::Primary)) && self.text_edit.is_some()
+        {
+            self.commit_text_edit();
+        }
         // 画布画在背景层,工具条等 egui 浮窗在其上
         let canvas_painter = ctx.layer_painter(LayerId::new(Order::Background, Id::unique("canvas")));
         // 冻结的桌面底图:最底层,不随 shot_skip_ink/chrome 隐藏
@@ -750,7 +768,7 @@ impl App {
 
         if !self.shot_skip_chrome {
             self.toolbar_ui(ctx);
-            self.text_edit_ui(ctx);
+            self.draw_live_text(ctx, &canvas_painter);
             self.settings_ui(ctx);
         }
 
@@ -775,10 +793,25 @@ impl App {
         let shift = ctx.input(|i| i.modifiers.shift);
 
         if esc {
-            // 优先级:正在框选拖拽 > 已有选区 > 文字编辑 > 放大镜 > 退出标注
+            // 优先级:正在框选拖拽 > 文字编辑 > 已有选区 > 放大镜 > 退出标注
+            // (正在写字时 Esc 必须先退出文字;否则上次会话恢复的选区会把
+            //  第一次 Esc 吃掉,用户看起来就是"Esc 退不出")
+            if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+                eprintln!(
+                    "[esc] region_armed={} has_sel={} editing={}",
+                    self.region_armed,
+                    self.region_sel.is_some(),
+                    editing
+                );
+            }
             if self.region_armed {
                 self.region_armed = false;
                 self.region_sel = None;
+            } else if self.text_edit.take().is_some() {
+                // 取消文字编辑
+                if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+                    eprintln!("[esc] text edit cancelled");
+                }
             } else if self.region_sel.take().is_some() {
                 // 清除选区,恢复全屏保存/复制
                 self.region_zoom = 1.0;
@@ -789,8 +822,6 @@ impl App {
                 self.bg_pending_since = None;
                 self.debak_started = None;
                 self.debak_frames = 0;
-            } else if self.text_edit.take().is_some() {
-                // 取消文字编辑
             } else if self.magnifier {
                 self.magnifier = false;
             } else {
@@ -894,7 +925,9 @@ impl App {
                     self.drawing, self.tool
                 );
             }
-            if !down || over_ui || editing {
+            // 注意不再用 editing 挡点击:编辑中点击=提交(帧首已提交),文字工具
+            // 点画布会接着打开新编辑;拖拽期间 current 为 None,不会误画。
+            if !down || over_ui {
                 if self.drawing {
                     self.drawing = false;
                     self.eraser_last = None;
@@ -915,9 +948,6 @@ impl App {
                 } else if !self.drawing {
                     self.drawing = true;
                     self.begin_stroke(pos);
-                    if self.text_edit.is_some() {
-                        self.drawing = false; // 文字工具:打开编辑框,不进入拖拽
-                    }
                 } else if self.canvas.current.is_some() {
                     self.drag_stroke(pos, shift);
                 }
@@ -975,6 +1005,19 @@ impl App {
                 }
             }
         }
+        // 自检倒计时:自动用文字工具打开编辑(与真实点击同一入口 begin_stroke)
+        if self.texttest_frames > 0 {
+            self.texttest_frames -= 1;
+            ctx.request_repaint();
+            if self.texttest_frames == 0 {
+                let ls = self.screen_logical(ctx);
+                self.tool = Tool::Text;
+                self.begin_stroke(Pos2::new(ls.x * 0.3, ls.y * 0.3));
+                if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+                    eprintln!("[texttest] editor opened, editing={}", self.text_edit.is_some());
+                }
+            }
+        }
         // 自检倒计时:自动复制
         if self.autocopy_frames > 0 {
             self.autocopy_frames -= 1;
@@ -998,7 +1041,7 @@ impl App {
             Tool::Ellipse => Some(Ink::Ellipse { a: pos, b: pos, spec, filled: false }),
             Tool::EllipseFilled => Some(Ink::Ellipse { a: pos, b: pos, spec, filled: true }),
             Tool::Text => {
-                self.text_edit = Some(TextEditor { pos, buf: String::new(), focused: false });
+                self.text_edit = Some(TextEditor { pos, buf: String::new(), preedit: None });
                 None
             }
             Tool::CheckStamp => {
@@ -1931,39 +1974,133 @@ impl App {
 
     // ---------- 文字工具 ----------
 
-    fn text_edit_ui(&mut self, ctx: &Context) {
+    /// 文字编辑时收集本帧输入:普通字符、输入法组词/上屏、退格、回车。
+    /// 不再使用弹窗 TextEdit:文字直接在画布上编辑,Escape/点击由外层统一处理。
+    fn text_editor_input(&mut self, ctx: &Context) {
         if self.text_edit.is_none() {
             return;
         }
-        let mut committed: Option<(Pos2, String)> = None;
-        egui::Window::new("text_edit")
-            .title_bar(false)
-            .resizable(false)
-            .collapsible(false)
-            .fixed_pos(self.text_edit.as_ref().unwrap().pos + egui::vec2(10.0, 10.0))
-            .show(ctx, |ui| {
-                let te = self.text_edit.as_mut().unwrap();
-                let resp = ui.add_sized([240.0, 28.0], egui::TextEdit::singleline(&mut te.buf));
-                if !te.focused {
-                    te.focused = true;
-                    resp.request_focus();
+        let mut typed = String::new();
+        let mut ime_commit: Option<String> = None;
+        let mut ime_preedit: Option<String> = None;
+        let mut ime_delete_before: usize = 0;
+        let mut backspace = false;
+        let mut enter = false;
+        ctx.input(|i| {
+            for e in &i.events {
+                match e {
+                    egui::Event::Text(t) => typed.push_str(t),
+                    egui::Event::Ime(ev) => match ev {
+                        egui::ImeEvent::Preedit { text, .. } => ime_preedit = Some(text.clone()),
+                        egui::ImeEvent::Commit(s) => ime_commit = Some(s.clone()),
+                        egui::ImeEvent::DeleteSurrounding { before_chars, .. } => {
+                            ime_delete_before = *before_chars;
+                        }
+                        _ => {}
+                    },
+                    // 组词时这些键会被输入法转成 VK_PROCESSKEY,不会到这里
+                    egui::Event::Key { key: Key::Backspace, pressed: true, .. } => backspace = true,
+                    egui::Event::Key { key: Key::Enter, pressed: true, .. } => enter = true,
+                    _ => {}
                 }
-                if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    committed = Some((te.pos, te.buf.clone()));
-                }
-            });
-        if let Some((pos, text)) = committed {
-            if !text.trim().is_empty() {
-                let size = (self.width * 5.0).clamp(18.0, 72.0);
-                self.canvas.shapes.push(Ink::Text {
-                    pos,
-                    text,
-                    size,
-                    color: self.effective_color(),
-                });
             }
-            self.text_edit = None;
+        });
+        if let Some(te) = self.text_edit.as_mut() {
+            if te.preedit.is_none() {
+                for _ in 0..ime_delete_before.max(if backspace { 1 } else { 0 }) {
+                    te.buf.pop();
+                }
+            }
+            te.buf.push_str(&typed);
+            if let Some(s) = &ime_commit {
+                te.buf.push_str(s);
+            }
+            if let Some(p) = ime_preedit {
+                // 空组词串 = 输入法取消了组词
+                te.preedit = if p.is_empty() { None } else { Some(p) };
+            }
+            if ime_commit.is_some() {
+                te.preedit = None;
+            }
         }
+        if enter {
+            self.commit_text_edit();
+        }
+    }
+
+    /// 提交正在编辑的文字并关闭编辑;空文本不落墨(与旧弹窗行为一致)。
+    /// 走 push_instant:文字可撤销,且不会残留 redo 栈。
+    fn commit_text_edit(&mut self) {
+        let Some(te) = self.text_edit.take() else { return };
+        if te.buf.trim().is_empty() {
+            return;
+        }
+        let size = (self.width * 5.0).clamp(18.0, 72.0);
+        self.canvas.push_instant(Ink::Text {
+            pos: te.pos,
+            text: te.buf,
+            size,
+            color: self.effective_color(),
+        });
+    }
+
+    /// 画布直接输入的实时预览:已输入文本 + 输入法组词(带下划线)+ 闪烁光标,
+    /// 同时把 IME 候选窗定位到光标处(等价于旧 TextEdit 的 output.ime)。
+    fn draw_live_text(&mut self, ctx: &Context, canvas_painter: &egui::Painter) {
+        let Some(te) = &self.text_edit else { return };
+        let size = (self.width * 5.0).clamp(18.0, 72.0);
+        let color = self.effective_color();
+        let font = FontId::proportional(size);
+        // 与墨迹同一裁剪:有选区时超出选框的部分不显示
+        let painter = match self.region_sel {
+            Some(sel) => canvas_painter.with_clip_rect(Rect::from_two_pos(sel.start, sel.cur)),
+            None => canvas_painter.clone(),
+        };
+        let origin = te.pos;
+        painter.text(origin, Align2::LEFT_TOP, te.buf.clone(), font.clone(), color);
+        let buf_w = if te.buf.is_empty() {
+            0.0
+        } else {
+            painter.layout_no_wrap(te.buf.clone(), font.clone(), color).size().x
+        };
+        let mut caret_x = buf_w;
+        if let Some(pre) = &te.preedit {
+            let pre_gal = painter.layout_no_wrap(pre.clone(), font.clone(), color);
+            let pre_pos = origin + egui::vec2(caret_x, 0.0);
+            painter.text(pre_pos, Align2::LEFT_TOP, pre.clone(), font.clone(), color);
+            // 组词部分画下划线,提示尚未上屏
+            painter.rect_filled(
+                Rect::from_min_size(
+                    pre_pos + egui::vec2(0.0, pre_gal.size().y - 2.0),
+                    egui::vec2(pre_gal.size().x, 2.0),
+                ),
+                0.0,
+                color.gamma_multiply(0.7),
+            );
+            caret_x += pre_gal.size().x;
+        }
+        // 光标闪烁(空闲时段也要重绘才会闪)
+        let blink_on = (ctx.input(|i| i.time) * 2.5) as usize % 2 == 0;
+        if blink_on {
+            painter.rect_filled(
+                Rect::from_min_size(origin + egui::vec2(caret_x, 0.0), egui::vec2(2.0, size)),
+                0.0,
+                color,
+            );
+        }
+        ctx.request_repaint_after(Duration::from_millis(300));
+        // 打开输入法并把候选窗定位到光标处;编辑结束后 output.ime 恢复 None,IME 自动关闭
+        let ime_rect = Rect::from_min_size(origin, egui::vec2(caret_x.max(20.0), size));
+        let cursor_rect =
+            Rect::from_min_size(origin + egui::vec2(caret_x, 0.0), egui::vec2(2.0, size));
+        ctx.output_mut(|o| {
+            o.ime = Some(egui::output::IMEOutput {
+                purpose: egui::IMEPurpose::Normal,
+                rect: ime_rect,
+                cursor_rect,
+                should_interrupt_composition: false,
+            });
+        });
     }
 
     // ---------- 导出 ----------
