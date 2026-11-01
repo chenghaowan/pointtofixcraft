@@ -1,6 +1,8 @@
 # PointToFix Craft — 屏幕标注工具(Rust 重写版)
 
 > English README: [README.md](README.md)
+>
+> 代码仓库:[GitHub](https://github.com/chenghaowan/pointtofixcraft) · [Gitee 镜像](https://gitee.com/chenghaowan/pointtofixcraft)(国内更快)
 
 以经典屏幕标注软件 [Pointofix](https://www.pointofix.de/)(Delphi 编写,1.8.0)为逆向分析目标,
 用 **Rust + eframe/egui + windows-rs** 从零重写的练手项目(REA:Reverse Engineer Everything)。

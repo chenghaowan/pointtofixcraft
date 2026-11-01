@@ -25,7 +25,7 @@ It is built for the everyday "explain something on screen" job: annotate while p
 
 ## Download
 
-Grab the portable build from the [**Releases**](https://github.com/chenghaowan/pointtofixcraft/releases) page:
+Grab the portable build from the [**Releases**](https://github.com/chenghaowan/pointtofixcraft/releases) page (also mirrored on [Gitee Releases](https://gitee.com/chenghaowan/pointtofixcraft/releases) — faster in mainland China):
 
 | File | Contents | Size |
 | --- | --- | --- |
@@ -133,7 +133,8 @@ Everything is stored as plain text under `%APPDATA%\pointtofix\`:
 ### Build
 
 ```bash
-git clone https://github.com/chenghaowan/pointtofixcraft.git
+git clone https://github.com/chenghaowan/pointtofixcraft.git  # GitHub
+git clone https://gitee.com/chenghaowan/pointtofixcraft.git   # Gitee mirror, faster in mainland China
 cd pointtofixcraft
 
 cargo run              # debug build, keeps the console for POINTTOFIX_* debug output
