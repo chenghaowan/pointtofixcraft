@@ -10,7 +10,7 @@ Freeze the screen, draw on it, wipe the background behind a selection, then save
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D6?logo=windows&logoColor=white)](#requirements)
 [![Rust](https://img.shields.io/badge/rust-2021-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-0.2.0-2ea44f)](https://github.com/chenghaowan/pointtofixcraft/releases)
+[![Version](https://img.shields.io/badge/version-0.2.1-2ea44f)](https://github.com/chenghaowan/pointtofixcraft/releases)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [Download](#download) · [Features](#features) · [Hotkeys](#hotkeys) · [Build](#build-from-source) · [Architecture](#architecture) · [Roadmap](#roadmap) · [中文说明](README.zh-CN.md)

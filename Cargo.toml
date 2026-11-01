@@ -1,6 +1,6 @@
 [package]
 name = "pointtofix"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "PointToFix — 屏幕标注工具(Rust 重写版,REA 练手项目)"
 
