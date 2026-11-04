@@ -311,8 +311,11 @@ fn http_download(
         let _ = std::fs::create_dir_all(dir);
     }
     unsafe {
+        // User-Agent 必须带上:魔搭的 LFS CDN(cdn-lfs-cn-1.modelscope.cn)对
+        // 空 UA 直接 403(实测 2026-11-05);WinHttpOpen 的 agent 就是 UA 头。
+        let agent = HSTRING::from("Mozilla/5.0 (Windows NT 10.0; Win64; x64) PointToFix/0.3");
         let session = WinHttpOpen(
-            PCWSTR::null(),
+            PCWSTR(agent.as_ptr()),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
             PCWSTR::null(),
             PCWSTR::null(),
@@ -458,6 +461,76 @@ fn read_response(
     }
 }
 
+/// 只取响应头(GET + status + Content-Length,不读 body):测试/诊断用
+pub fn probe_url(url: &str) -> Result<(u32, u64), String> {
+    use windows::Win32::Networking::WinHttp::*;
+    let Some((secure, host, path)) = split_url(url) else {
+        return Err(format!("无法解析 URL: {url}"));
+    };
+    let agent = HSTRING::from("Mozilla/5.0 (Windows NT 10.0; Win64; x64) PointToFix/0.3");
+    unsafe {
+        let session = WinHttpOpen(
+            PCWSTR(agent.as_ptr()),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err(last_err("WinHttpOpen"));
+        }
+        let result = (|| -> Result<(u32, u64), String> {
+            let hconnect = WinHttpConnect(
+                session,
+                PCWSTR(HSTRING::from(&host).as_ptr()),
+                if secure { 443u16 } else { 80u16 },
+                0,
+            );
+            if hconnect.is_null() {
+                return Err(last_err("WinHttpConnect"));
+            }
+            let flags = if secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
+            let hrequest = WinHttpOpenRequest(
+                hconnect,
+                PCWSTR(HSTRING::from("GET").as_ptr()),
+                PCWSTR(HSTRING::from(&path).as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                std::ptr::null(),
+                flags,
+            );
+            if hrequest.is_null() {
+                let r = last_err("WinHttpOpenRequest");
+                let _ = WinHttpCloseHandle(hconnect);
+                return Err(r);
+            }
+            let policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+            let _ = WinHttpSetOption(
+                Some(hrequest),
+                WINHTTP_OPTION_REDIRECT_POLICY,
+                Some(std::slice::from_raw_parts(
+                    &policy as *const u32 as *const u8,
+                    std::mem::size_of::<u32>(),
+                )),
+            );
+            let out = (|| -> Result<(u32, u64), String> {
+                WinHttpSendRequest(hrequest, None, None, 0, 0, 0)
+                    .map_err(|e| format!("连接失败: {e}"))?;
+                WinHttpReceiveResponse(hrequest, std::ptr::null_mut())
+                    .map_err(|e| format!("接收响应失败: {e}"))?;
+                let status = query_u32(hrequest, WINHTTP_QUERY_STATUS_CODE)?;
+                let len = query_u32(hrequest, WINHTTP_QUERY_CONTENT_LENGTH).unwrap_or(0) as u64;
+                Ok((status, len))
+            })();
+            let _ = WinHttpCloseHandle(hrequest);
+            let _ = WinHttpCloseHandle(hconnect);
+            out
+        })();
+        let _ = WinHttpCloseHandle(session);
+        result
+    }
+}
+
 fn query_u32(request: Handle, flag: u32) -> Result<u32, String> {
     use windows::Win32::Networking::WinHttp::*;
     let mut value: u32 = 0;
@@ -491,6 +564,32 @@ mod tests {
             Some((false, "x.cn".into(), "/".into()))
         );
         assert_eq!(split_url("ftp://x"), None);
+    }
+
+    /// 真机网络自检:POINTTOFIX_TEST_NET=1 时验证魔搭直链可达且 UA 修复生效。
+    /// det(5MB)走完整下载路径;fp16(88MB)只探测响应头。
+    #[test]
+    fn modelscope_downloads_work_with_ua() {
+        if std::env::var("POINTTOFIX_TEST_NET").is_err() {
+            return;
+        }
+        let (status, len) = probe_url(download_url(
+            ModelKind::IsnetFp16,
+            Source::ModelScope,
+        ))
+        .expect("探测 ISNet fp16 失败");
+        assert_eq!(status, 200, "ISNet fp16 应 200");
+        assert!(len > 80_000_000, "fp16 应约 88MB,实际 {len}");
+
+        let dir = std::env::temp_dir().join("ptf-net-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let dest = dir.join(ModelKind::OcrDet.file_name());
+        let _ = std::fs::remove_file(&dest);
+        http_download(ModelKind::OcrDet, download_url(ModelKind::OcrDet, Source::ModelScope), &dest, &std::sync::atomic::AtomicBool::new(false))
+            .expect("det 下载失败");
+        let size = std::fs::metadata(&dest).expect("det 文件不存在").len();
+        assert!(size > 4_000_000, "det 应约 4.8MB,实际 {size}");
+        let _ = std::fs::remove_file(&dest);
     }
 
     #[test]
