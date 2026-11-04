@@ -38,26 +38,37 @@ Unzip anywhere and double-click `pointtofix.exe`. No installer, no VC++ redistri
 ## Features
 
 **Standby & session**
-- A small always-on-top panel in the corner of the screen. Drag it by the top bar, click **Start** to annotate, click **×** to quit.
+- A small always-on-top panel in the corner of the screen. Drag it by the top bar, click **Start** to annotate, click **×** to hide to the **system tray** (Show / Exit in the tray menu — the app keeps running, so the next annotation starts instantly).
 - Panel position is remembered in **physical pixels**, so it stays put across monitors with different DPI scaling.
-- **Multi-monitor, one screen at a time:** the overlay covers exactly the display the Start button was on. Other displays are untouched — nothing is captured, drawn, or blocked there. Save/copy/print also only contain that display, rendered at its own DPI.
+- **Multi-monitor, one screen at a time:** the overlay covers exactly the display the Start button was on. Other displays are untouched — nothing is captured, drawn, or blocked there. Save/copy also only contain that display, rendered at its own DPI.
 - The overlay follows resolution and scaling changes, and falls back to the primary display when a monitor is unplugged.
 
 **Drawing**
 - Vertical toolbar with hand-drawn vector icons and localized tooltips, matching the original column layout.
 - Two color columns: **opaque** on the left, **transparent (highlighter)** on the right — applies to every tool.
-- Pen widths **2 / 4 / 8 / 12 px**, which also scale the check/cross stamps and the eraser.
-- Pen, **circular eraser**, line, arrow, rectangle, filled rectangle, ellipse, filled ellipse, double arrow, text, ✓ / ✗ stamps.
+- Pen widths **2 / 4 / 8 / 12 px**, which also scale the check/cross stamps, the signature stamps and the eraser.
+- Pen, **circular eraser**, line, arrow, rectangle, filled rectangle, ellipse, filled ellipse, double arrow, text, ✓ / ✗ stamps, text signature stamp, and a **hand-drawn signature stamp** (draw your signature once in Settings; it's stored as vector strokes, so undo/eraser keep working).
 - **The eraser is a brush, not "delete whole stroke":** it cuts strokes, arrows, rectangles and ellipses inside the circle, punches a circular hole out of filled shapes, and removes only the arrow head when you circle it.
 - `Shift` snaps lines and arrows to 45° increments, rectangles to squares, ellipses to circles.
 - Undo / redo stack, clear-all.
 
 **Selection & export**
-- **Region select** (`Ctrl+R`): drag a marquee, keep it visible with its pixel dimensions; save/copy/print apply to the selection, otherwise to the whole screen. Ink is clipped to the marquee so the export matches what you drew. The selection is persisted in `%APPDATA%\pointtofix\region.txt` and restored on the next session.
+- **Region select** (`Ctrl+R`): drag a marquee, keep it visible with its pixel dimensions; save/copy apply to the selection, otherwise to the whole screen. Ink is clipped to the marquee so the export matches what you drew. The selection is persisted in `%APPDATA%\pointtofix\region.txt` and restored on the next session.
 - **Zoom the selection** ×1 → ×2 → ×4 → ×8 → ×10, anchored at the selection center on the frozen frame.
-- **Save** writes `pointtofix_<timestamp>.webp` to the desktop (switchable to PNG), **copy** puts the annotated screen on the clipboard as uncompressed RGBA, **print** goes to the default printer, scaled to fit and centered.
+- **Save** writes `PointToFix_20261104_153012.webp` (readable local timestamp, `_2` on same-second collisions) to **`%APPDATA%\pointtofix\gallery\`** — never the desktop — and indexes the shot into the gallery database. **Copy** puts the annotated screen on the clipboard as uncompressed RGBA.
 - WebP quality is adjustable **1–100**, or choose **lossless** for a bit-identical result. Measured on a 2560×1600 desktop: **PNG 2.50 MB → WebP q85 255 KB (~1/10)**, lossless WebP 1.22 MB.
 - The toolbar and marquee are hidden in exports by default; **debug mode** includes them so you can report UI bugs.
+
+**OCR with automatic numbering (PP-OCRv5 Mobile)**
+- Finish a marquee and the raw region (pre-annotation, cropped from the frozen frame) is recognized on a background thread (~0.5 s on CPU). Every detected text block gets an **orange ①②③ badge** stamped at its top-left corner — burned into the exported image, so documents can reference "①" directly.
+- Numbers follow reading order (rows top→bottom, left→right within a row). Text is recognized *before* you annotate, so `ocr_text` stays clean while the picture shows the badges.
+- One recognition model covers **Simplified/Traditional Chinese, English and Japanese**. Toolbar `OCR` button shows the numbered lines with copy-all.
+- Models (`det` ~5 MB + `rec` ~16 MB + dictionary ~0.2 MB) can be downloaded **inside the app** (Settings → model downloads, ModelScope by default / HuggingFace, with progress) or via `scripts/fetch_ppocr.py`.
+
+**Gallery (SQLite + FTS5)**
+- Every save lands in a searchable gallery: dual-pane window (`Ctrl+G`) with a **thumbnail grid** (lazy-loaded, LRU-cached) on the left and a **live preview** on the right — metadata, numbered OCR lines, copy image / copy numbered text / delete to **recycle bin** / open location.
+- Full-text search over OCR text and source app. Trigram tokenizer (built into SQLite) handles Chinese/English/Japanese substrings; queries shorter than 3 characters fall back to `LIKE`.
+- Storage is an open contract: `gallery.db` (WAL, read-only concurrent access) + plain image files. External tools — e.g. RAG pipelines or AI agents — can query it directly, see **[Gallery database (AI access)](#gallery-database-ai-access)**.
 
 **Extras**
 - **Magnifier** (`Ctrl+M`): follows the cursor, 1.5×–8× via the mouse wheel.
@@ -76,7 +87,8 @@ Unzip anywhere and double-click `pointtofix.exe`. No installer, no VC++ redistri
 | `Ctrl+D` | Toggle background removal inside the selection |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `Ctrl+M` | Toggle the cursor magnifier |
-| `Ctrl+I` | Settings (language, save format, background engine, debug mode) |
+| `Ctrl+G` | Open the gallery |
+| `Ctrl+I` | Settings (language, save format, background engine, OCR, model downloads, debug mode) |
 | Wheel | Magnifier zoom factor |
 
 > Hotkeys use `Ctrl` combinations on purpose: with a Chinese IME active, bare letter keys get swallowed by composition.
@@ -108,19 +120,37 @@ python scripts/fetch_isnet.py --variant int8 # int8 (44 MB, smallest)
 python scripts/fetch_isnet.py --variant fp32 # fp32 (176 MB, official)
 ```
 
-Sources: [onnx-community/ISNet-ONNX](https://www.modelscope.cn/models/onnx-community/ISNet-ONNX) and [dragonsoar/imging-background-removal](https://www.modelscope.cn/models/dragonsoar/imging-background-removal) on ModelScope (mirrors that are directly reachable from mainland China), or the official rembg `isnet-general-use.onnx`.
+Sources: [onnx-community/ISNet-ONNX](https://www.modelscope.cn/models/onnx-community/ISNet-ONNX) and [dragonsoar/imging-background-removal](https://www.modelscope.cn/models/dragonsoar/imging-background-removal) on ModelScope (mirrors that are directly reachable from mainland China), or the official rembg `isnet-general-use.onnx`. Models can also be downloaded **from inside the app**: Settings → model downloads (ModelScope by default, HuggingFace optional; progress bar, cancel; files land in `%APPDATA%\pointtofix\models\` and are picked up automatically).
+
+## Gallery database (AI access)
+
+The gallery is designed as an **open interface** — no MCP server needed. Any external tool (RAG pipeline, AI agent, script) can:
+
+1. **Read the database** `%APPDATA%\pointtofix\gallery.db` (WAL mode, safe for concurrent read-only access). The full schema and query recipes are in [`docs/db-schema.md`](docs/db-schema.md). The AI-facing skill file is at [`.agents/skills/pointtofix/SKILL.md`](.agents/skills/pointtofix/SKILL.md) — copy it into `%USERPROFILE%\.agents\skills\` to teach your agent the paths, FTS syntax and pitfalls.
+2. **Capture headlessly** with the CLI — this is how an AI agent takes a screenshot on its own:
+
+```bash
+pointtofix.exe --capture 100,100,800,600 --ocr --json
+# -> {"id":42,"file":"C:\\...\\PointToFix_20261104_153012.png","ocr":[{"no":1,"text":"..."}]}
+pointtofix.exe --capture 0,0,1920,1080 --out D:\tmp\shot.png   # temp file, no database
+```
+
+`--capture` takes virtual-desktop physical pixels (same semantics as the GUI marquee); without `--out` the shot is saved into the gallery and indexed, and `--json` prints a machine-readable receipt. Exit codes: 0 ok, 1 failure, 2 bad args. A bundled MCP server is deliberately out of scope for now — direct DB access plus the CLI already covers retrieval and capture; structured MCP tools remain a future option.
 
 ## Settings & persistence
 
-`Ctrl+I` opens the settings window (language, screenshot format and quality, background-removal engine and model status, about, debug mode). Changes apply immediately.
+`Ctrl+I` opens the settings window (language, screenshot format and quality, background-removal engine, OCR auto-numbering, model downloads, hand-drawn signature editor, about, debug mode). Changes apply immediately.
 
-Everything is stored as plain text under `%APPDATA%\pointtofix\`:
+Everything lives under `%APPDATA%\pointtofix\`:
 
 | File | Contents |
 | --- | --- |
-| `ui.txt` | `lang=zh\|en\|de\|ja`, `format=webp\|png`, `quality=1..100`, `lossless=1` |
+| `ui.txt` | `lang=zh\|en\|de\|ja`, `format=webp\|png`, `quality=1..100`, `lossless=1`, `ocr_auto=0` |
 | `region.txt` | Selection rectangle, restored on the next session |
-| `models\` | Optional drop-in location for ISNet models and `onnxruntime.dll` |
+| `signature_strokes.txt` | Hand-drawn signature template (normalized strokes, one polyline per line) |
+| `gallery.db` | Gallery database (SQLite + FTS5, WAL) — see schema doc above |
+| `gallery\` | Saved screenshots + `thumbs\` thumbnails |
+| `models\` | Optional drop-in location for ISNet / PP-OCR models; the in-app downloader writes here |
 
 ## Build from source
 
@@ -141,7 +171,7 @@ cargo run              # debug build, keeps the console for POINTTOFIX_* debug o
 cargo build --release  # target/release/pointtofix.exe, ~17 MB
 ```
 
-The release binary is self-contained: keying background removal, annotation, WebP/PNG encoding and printing all work with just the exe. The release profile enables `strip` and thin LTO; `windows_subsystem = "windows"` keeps the console hidden. Only AI background removal needs `onnxruntime.dll` and a model beside the binary.
+The release binary is self-contained: keying background removal, annotation, WebP/PNG encoding, the gallery and OCR (once models are present) all work with just the exe. The release profile enables `strip` and thin LTO; `windows_subsystem = "windows"` keeps the console hidden. Only AI features need `onnxruntime.dll` and models beside the binary.
 
 ### Portable package
 
@@ -170,29 +200,37 @@ PointToFix Craft keeps the original structure — *two windows and a display lis
 | Full-screen transparent drawing layer | Borderless always-on-top `eframe` window sized to the **current display's physical rect**, with the frozen desktop capture as an opaque backdrop and ink drawn on `Order::Background` |
 | Vertical toolbar | An `egui` floating window inside the same viewport, above the canvas |
 | VCL/GDI drawing | Vector ink list (`Vec<Ink>`) repainted by `epaint`; undo = pop the stack |
-| Print / save screen contents | `BitBlt(SRCCOPY \| CAPTUREBLT)` captures layered windows too, so ink is included |
-
-> **Why the frozen backdrop instead of a transparent window:** on numerous AMD/NVIDIA drivers and Remote Desktop sessions, a wgpu transparent surface reports `Opaque` and composites to black — that is what made "Start annotation" go black on some machines. Capturing the display up front and painting it as an opaque base matches the original's behavior (the screen is frozen anyway) and removes the dependency on window transparency entirely.
+| Save screen contents | `BitBlt(SRCCOPY \| CAPTUREBLT)` captures layered windows too, so ink is included |
 
 ```
 src/
-├── main.rs     # entry point: window attributes (transparent / borderless / topmost) + window icon
+├── main.rs     # entry point: CLI dispatch (--capture headless mode) or window attributes + window icon
 ├── app.rs      # state machine (Standby ⇄ Active), frozen backdrop, toolbar & settings UI,
-│               # input handling, hotkeys, export encoding (WebP/PNG)
+│               # input handling, hotkeys, export encoding, gallery insertion, OCR badges,
+│               # tray events, model-download polling, signature editor
 ├── i18n.rs     # UI strings for 中文 / English / Deutsch / 日本語 (static tables)
 ├── icons.rs    # vector toolbar icons drawn with epaint (no icon font dependency)
 ├── ink.rs      # ink model (vector shapes + repaint + undo/redo stack)
-├── capture.rs  # Win32 GDI capture by display/region (BGRA→RGBA, monitor enumeration)
+├── capture.rs  # Win32 GDI capture by display/region, in-memory crop, source-app detection
 ├── bgremove.rs # background removal: keying algorithm + background job queue (keying/ISNet auto fallback)
 ├── isnet.rs    # ISNet model discovery, ONNX Runtime inference, mask post-processing (matting off)
-└── printing.rs # GDI printing (default printer, fit-to-page, centered)
+├── ocr.rs      # PP-OCRv5 Mobile det/rec + CTC decode, reading-order numbering, background worker
+├── gallery.rs  # SQLite + FTS5 storage layer + dual-pane gallery window (thumbs, preview, delete)
+├── download.rs # WinHTTP model downloader (ModelScope / HuggingFace, progress, cancel, queue)
+├── tray.rs     # system tray (tray-icon): show / exit events from the global callback thread
+└── cli.rs      # headless mode: --capture x,y,w,h [--out] [--ocr] [--json]
 
-assets/                # app.ico (multi-size PE resource) + pointtofixcraft.png (window icon)
+assets/                # app.ico (multi-size PE resource) + pointtofixcraft.png (window/tray icon)
 build.rs               # embeds assets/app.ico into the PE resource section via embed-resource
 scripts/make_icon.py   # regenerates the icon (Python + Pillow)
-scripts/fetch_isnet.py # downloads the ISNet model + prepares onnxruntime.dll
+scripts/fetch_isnet.py # downloads the ISNet model + prepares onnxruntime.dll (offline channel)
+scripts/fetch_ppocr.py # downloads PP-OCRv5 det/rec/dictionary (offline channel)
+docs/db-schema.md      # gallery database contract for external tools / RAG
+.agents/skills/pointtofix/SKILL.md # AI-agent skill: how to query the gallery & drive the CLI
 build-portable.bat     # release build + portable dist folder + zip
 ```
+
+> **Why the frozen backdrop instead of a transparent window:** on numerous AMD/NVIDIA drivers and Remote Desktop sessions, a wgpu transparent surface reports `Opaque` and composites to black — that is what made "Start annotation" go black on some machines. Capturing the display up front and painting it as an opaque base matches the original's behavior (the screen is frozen anyway) and removes the dependency on window transparency entirely. The same frozen capture is what OCR crops from — zero extra screen grabs.
 
 The icon keeps the Pointofix idea of a four-color disc with a red marker and a pointer, with a Rust gear badge in the corner; run `python scripts/make_icon.py` after editing it.
 

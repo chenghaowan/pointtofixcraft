@@ -46,7 +46,7 @@ const MASK_SOFTNESS: f32 = 0.12;
 /// onnxruntime 的 Environment 进程内只能建一次(init_from 也只能调一次)
 static ENVIRONMENT: OnceLock<Result<ort::environment::Environment, String>> = OnceLock::new();
 
-fn environment() -> Result<&'static ort::environment::Environment, String> {
+pub(crate) fn environment() -> Result<&'static ort::environment::Environment, String> {
     ENVIRONMENT
         .get_or_init(|| {
             let dll = find_dll().ok_or_else(|| {
@@ -245,7 +245,8 @@ pub fn composite_on_white(shot: &Shot, mask: &[u8]) -> Vec<u8> {
 }
 
 /// 查找目录列表:exe 目录、工作目录,以及各自的 models / assets 子目录,最后是用户目录
-fn search_dirs() -> Vec<PathBuf> {
+/// (OCR 的 det/rec/词典复用同一套目录;download 模块的落地目录也在白名单内)
+pub(crate) fn search_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
@@ -267,7 +268,7 @@ fn search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn find_in_dirs(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_in_dirs(name: &str) -> Option<PathBuf> {
     for dir in search_dirs() {
         let p = dir.join(name);
         if p.is_file() {

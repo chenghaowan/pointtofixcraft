@@ -13,6 +13,7 @@ use egui::{
 };
 use image::ImageEncoder;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use sha2::Digest;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
 use windows::Win32::Graphics::Gdi::HMONITOR;
@@ -23,11 +24,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::bgremove::{self, BgEngine, BgIssue, BgMethod};
 use crate::capture;
+use crate::download::{self, ModelKind, Source};
+use crate::gallery;
 use crate::i18n::{self, Lang};
 use crate::icons::{self, Icon};
 use crate::ink::{freehand, with_alpha, Canvas, Ink, Spec, Tool};
 use crate::isnet;
-use crate::printing;
+use crate::ocr::{self, OcrError};
+use crate::tray::{self, TrayEvent};
 
 pub const STANDBY_SIZE: Vec2 = Vec2::new(132.0, 96.0);
 const BAR_WIDTH: f32 = 96.0;
@@ -66,7 +70,6 @@ pub enum Mode {
 enum ShotJob {
     Save,
     Copy,
-    Print,
 }
 
 /// 截图状态机:Idle → NeedFrame(下一帧渲染时决定是否隐藏工具条) → Sent(已请求帧缓冲截图)
@@ -200,6 +203,8 @@ pub struct App {
     selftest_countdown: u32,
     /// 自检:POINTTOFIX_TEXTTEST=1 时,激活后 N 帧自动用文字工具打开编辑(验证文字输入/Esc 链路)
     texttest_frames: u32,
+    /// 自检:POINTTOFIX_GALLERYTEST=1 时,激活后 N 帧自动打开画廊(配合 AUTOSAVE 导出帧验证画廊渲染)
+    gallerytest_frames: u32,
     // 截图合成管线(DWM 透明窗口不在 BitBlt 里,需合入 egui 帧缓冲)
     shot_job: Option<ShotJob>,
     shot_phase: ShotPhase,
@@ -221,6 +226,48 @@ pub struct App {
     autocopy_frames: u32,
     /// 自检:POINTTOFIX_STAMPTEST=1 时,激活后 N 帧自动盖勾/叉章(验证盖章链路)
     stamp_frames: u32,
+    // ---------- 托盘 ----------
+    tray: Option<tray::Tray>,
+    /// × 之后待机面板藏进托盘(真退出走托盘菜单)
+    hidden: bool,
+    // ---------- 画廊 ----------
+    show_gallery: bool,
+    gallery: gallery::GalleryUi,
+    /// 进入标注那一刻的来源软件标题(画廊 app_name 列,RAG 的"来源"维度)
+    source_app: Option<String>,
+    /// 进入标注时冻结的原始屏幕画面(OCR 直接从内存裁选区,不再抓屏)
+    backdrop_shot: Option<capture::Shot>,
+    // ---------- OCR(框选完成自动识别 + 序号圆标) ----------
+    /// 框选后自动识别(设置可关;编号依赖它)
+    ocr_auto: bool,
+    ocr_pending: Option<u64>,
+    /// 保存时 OCR 还没完成:结果回来后回写这一行
+    ocr_pending_row: Option<i64>,
+    /// 序号圆标(逻辑坐标 + 编号),烙进导出图
+    ocr_badges: Vec<(Rect, u32)>,
+    /// 最近一次识别的文本行(结果窗口 + 入库)
+    ocr_lines: Vec<ocr::OcrLine>,
+    ocr_failed: bool,
+    /// 本次会话是否真的跑过 OCR(恢复的选区没跑过,入库时不算 done)
+    ocr_ran: bool,
+    /// 模型缺失只提示一次(避免每张截图都弹)
+    ocr_missing_notified: bool,
+    show_ocr: bool,
+    // ---------- 模型下载 ----------
+    /// 已 toast 过终态的下载项(完成/失败只提示一次)
+    dl_seen: Vec<ModelKind>,
+    dl_source: Source,
+    // ---------- 手绘签名 ----------
+    /// 归一化笔画模板(设置里手绘;None = 还没画过)
+    hand_signature: Option<Vec<Vec<Pos2>>>,
+    sig_editor: Option<SigEditor>,
+}
+
+/// 手绘签名编辑器状态
+struct SigEditor {
+    /// 画布坐标的笔画
+    strokes: Vec<Vec<Pos2>>,
+    drawing: bool,
 }
 
 pub struct TextEditor {
@@ -240,8 +287,10 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         load_cjk_font(&cc.egui_ctx);
-        let (standby_px, bar_pos, debug_shot, lang, shot, bg_method, dark_light, signature) =
+        let (standby_px, bar_pos, debug_shot, lang, shot, bg_method, dark_light, signature, ocr_auto) =
             load_ui_state();
+        let tr = lang.strings();
+        let tray = tray::init(&cc.egui_ctx, tr.tray_show, tr.tray_exit);
         // 铺满虚拟屏要按物理像素精确定位,egui 的视口命令只有逻辑坐标(要经过窗口 DPI 换算),
         // 跨不同 DPI 的显示器会偏,所以这里留一份 HWND 直接 SetWindowPos
         let hwnd = cc.window_handle().ok().and_then(|handle| match handle.as_raw() {
@@ -305,6 +354,26 @@ impl App {
             autocopy_frames: 0,
             stamp_frames: 0,
             texttest_frames: 0,
+            gallerytest_frames: 0,
+            tray,
+            hidden: false,
+            show_gallery: false,
+            gallery: gallery::GalleryUi::default(),
+            source_app: None,
+            backdrop_shot: None,
+            ocr_auto,
+            ocr_pending: None,
+            ocr_pending_row: None,
+            ocr_badges: Vec::new(),
+            ocr_lines: Vec::new(),
+            ocr_failed: false,
+            ocr_ran: false,
+            ocr_missing_notified: false,
+            show_ocr: false,
+            dl_seen: Vec::new(),
+            dl_source: Source::ModelScope,
+            hand_signature: load_hand_signature(),
+            sig_editor: None,
         }
     }
 
@@ -459,7 +528,9 @@ impl App {
         if layout_changed || rect != self.screen || (ppp - self.layout_ppp).abs() > 0.001 {
             self.screen = rect;
             // 显示器/分辨率/DPI 变了:旧底图作废,重新冻结当前画面
-            self.backdrop = self.grab_backdrop().map(|shot| {
+            let grabbed = self.grab_backdrop();
+            self.backdrop_shot = grabbed.clone();
+            self.backdrop = grabbed.map(|shot| {
                 let image = ColorImage::from_rgba_unmultiplied(
                     [shot.width as usize, shot.height as usize],
                     &shot.rgba,
@@ -513,13 +584,26 @@ impl App {
         // 底图:窗口已经藏了整整一帧,画面里不会带待机面板。
         // 这张底图让标注层不再依赖窗口透明:部分 AMD/NVIDIA 驱动和远程桌面
         // 会把透明 wgpu 窗口合成成纯黑,铺上底图后最坏也只是"冻结的画面"。
-        self.backdrop = self.grab_backdrop().map(|shot| {
+        let grabbed = self.grab_backdrop();
+        // 同一份原始画面留给 OCR:框选完成后直接从内存裁区域,
+        // 不用再抓屏(抓屏会连带覆盖层,还要等 DWM 合成)
+        self.backdrop_shot = grabbed.clone();
+        self.backdrop = grabbed.map(|shot| {
             let image = ColorImage::from_rgba_unmultiplied(
                 [shot.width as usize, shot.height as usize],
                 &shot.rgba,
             );
             ctx.load_texture("backdrop", image, TextureOptions::LINEAR)
         });
+        // 来源软件:进入标注瞬间沿 Z 序找刚被切走的应用(画廊 app_name 列)
+        self.source_app = capture::previous_app_title();
+        self.ocr_pending = None;
+        self.ocr_pending_row = None;
+        self.ocr_badges.clear();
+        self.ocr_lines.clear();
+        self.ocr_failed = false;
+        self.ocr_ran = false;
+        self.ocr_missing_notified = false;
         self.fit_overlay_to_monitor(ctx);
         self.show_overlay();
         // 恢复上次的选框区域(默认显示选框,不进入拖拽定义模式);超出当前屏幕的部分裁掉
@@ -564,6 +648,10 @@ impl App {
         if std::env::var("POINTTOFIX_TEXTTEST").is_ok() {
             self.texttest_frames = 300;
         }
+        // 自检:POINTTOFIX_GALLERYTEST=1 时,激活后约 0.5s 打开画廊(与 AUTOSAVE 组合可导出画廊渲染帧)
+        if std::env::var("POINTTOFIX_GALLERYTEST").is_ok() {
+            self.gallerytest_frames = 40;
+        }
     }
 
     fn exit_active(&mut self, ctx: &Context) {
@@ -586,6 +674,15 @@ impl App {
         self.debak_frames = 0;
         self.magnifier = false;
         self.show_settings = false;
+        self.show_gallery = false;
+        self.show_ocr = false;
+        self.sig_editor = None;
+        self.ocr_pending = None;
+        self.ocr_pending_row = None;
+        self.ocr_badges.clear();
+        self.ocr_lines.clear();
+        self.ocr_failed = false;
+        self.backdrop_shot = None;
         self.mode = Mode::Standby;
         self.active_mon = None;
         self.screen = capture::primary_monitor_rect();
@@ -632,7 +729,13 @@ impl App {
                             egui::Button::new(egui::RichText::new("×").size(15.0)),
                         );
                         if close.on_hover_text(tr.exit_program_tip).clicked() {
-                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                            // 关闭 = 藏进托盘(真退出在托盘菜单);托盘建失败时保持旧行为
+                            if self.tray.is_some() {
+                                self.hidden = true;
+                                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                            } else {
+                                ctx.send_viewport_cmd(ViewportCommand::Close);
+                            }
                         }
                     });
                 });
@@ -731,12 +834,42 @@ impl App {
                     );
                 }
             }
+            // OCR 进行中:选区左上角小状态(截图帧隐藏,不进导出图)
+            if !self.shot_skip_chrome {
+                if let (Some(sel), true) = (self.region_sel, self.ocr_pending.is_some()) {
+                    let r = Rect::from_two_pos(sel.start, sel.cur);
+                    let painter = ctx.layer_painter(LayerId::new(Order::Middle, Id::unique("ocr_indicator")));
+                    let galley = painter.layout_no_wrap(
+                        tr.ocr_running.to_string(),
+                        FontId::proportional(12.0),
+                        Color32::WHITE,
+                    );
+                    let box_rect = Rect::from_min_size(
+                        r.left_top() + egui::vec2(8.0, 8.0),
+                        galley.size() + egui::vec2(14.0, 8.0),
+                    );
+                    painter.rect_filled(box_rect, 4.0, Color32::from_black_alpha(150));
+                    painter.galley(
+                        box_rect.min + egui::vec2(7.0, 4.0),
+                        galley,
+                        Color32::WHITE,
+                    );
+                }
+            }
             // 有选区时墨迹裁剪到选框内:超出选框的标注部分不显示(与导出画面一致)
             if let Some(sel) = self.region_sel {
                 let r = Rect::from_two_pos(sel.start, sel.cur);
                 self.canvas.paint(&canvas_painter.with_clip_rect(r));
             } else {
                 self.canvas.paint(&canvas_painter);
+            }
+            // OCR 序号圆标:与墨迹同层(烙进导出图),选区存在时同样裁剪
+            if !self.ocr_badges.is_empty() {
+                let p = match self.region_sel {
+                    Some(sel) => canvas_painter.with_clip_rect(Rect::from_two_pos(sel.start, sel.cur)),
+                    None => canvas_painter.clone(),
+                };
+                draw_badges(&p, &self.ocr_badges);
             }
         }
         // 光标:文字编辑时用输入光标;悬停在画布上且当前是文字工具时也用输入光标
@@ -822,6 +955,7 @@ impl App {
                 self.bg_pending_since = None;
                 self.debak_started = None;
                 self.debak_frames = 0;
+                self.clear_ocr();
             } else if self.magnifier {
                 self.magnifier = false;
             } else {
@@ -876,6 +1010,7 @@ impl App {
                 if i.key_pressed(Key::R) {
                     self.region_armed = !self.region_armed;
                     self.region_sel = None;
+                    self.clear_ocr();
                 }
                 if i.key_pressed(Key::M) {
                     self.magnifier = !self.magnifier;
@@ -1000,6 +1135,19 @@ impl App {
                 }
                 self.tool = Tool::Signature;
                 self.begin_stroke(c + egui::vec2(-80.0, -120.0));
+                // 手绘签名章:无模板时注入一条折线模板,自检无人值守也能盖出
+                if self.hand_signature.is_none() {
+                    self.hand_signature = Some(vec![vec![
+                        Pos2::new(0.05, 0.85),
+                        Pos2::new(0.2, 0.1),
+                        Pos2::new(0.35, 0.7),
+                        Pos2::new(0.5, 0.05),
+                        Pos2::new(0.65, 0.8),
+                        Pos2::new(0.95, 0.15),
+                    ]]);
+                }
+                self.tool = Tool::HandSignature;
+                self.begin_stroke(c + egui::vec2(-80.0, -240.0));
                 if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
                     eprintln!("[stamp] placed, shapes={}", self.canvas.shapes.len());
                 }
@@ -1015,6 +1163,17 @@ impl App {
                 self.begin_stroke(Pos2::new(ls.x * 0.3, ls.y * 0.3));
                 if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
                     eprintln!("[texttest] editor opened, editing={}", self.text_edit.is_some());
+                }
+            }
+        }
+        // 自检倒计时:自动打开画廊
+        if self.gallerytest_frames > 0 {
+            self.gallerytest_frames -= 1;
+            ctx.request_repaint();
+            if self.gallerytest_frames == 0 {
+                self.show_gallery = true;
+                if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+                    eprintln!("[gallerytest] opened, items={}", self.gallery.items_len());
                 }
             }
         }
@@ -1095,6 +1254,26 @@ impl App {
                     None
                 }
             }
+            Tool::HandSignature => {
+                // 手绘签名章:矢量笔画模板;没有模板时直接打开编辑器引导绘制
+                match self.hand_signature.clone() {
+                    Some(strokes) => {
+                        let size = (self.width * 9.0).clamp(28.0, 160.0);
+                        self.canvas.push_instant(Ink::Signature {
+                            pos: pos - egui::vec2(size / 2.0, size / 2.0),
+                            size,
+                            color: self.effective_color(),
+                            strokes,
+                        });
+                    }
+                    None => {
+                        let tr = self.lang.strings();
+                        self.set_toast(Err(tr.sig_missing.to_string()));
+                        self.sig_editor = Some(SigEditor { strokes: Vec::new(), drawing: false });
+                    }
+                }
+                None
+            }
         };
     }
 
@@ -1144,27 +1323,29 @@ impl App {
                     None => RegionSel { start: p, cur: p },
                 });
             }
-        } else if let Some(sel) = self.region_sel.take() {
-            // 松开:只保留选区,不立即保存;之后「存图/复制」只作用于选区
-            self.region_armed = false;
-            let r = Rect::from_two_pos(sel.start, sel.cur);
-            if r.width() >= 4.0 && r.height() >= 4.0 {
-                self.region_sel = Some(RegionSel { start: r.min, cur: r.max });
-                self.region_zoom = 1.0;
-                self.zoom_base = None;
-                self.region_clean = None;
-                self.bg_pending = None;
-                self.bg_pending_sel = None;
-                self.bg_pending_since = None;
-                self.debak_started = None;
-                self.debak_frames = 0;
-                save_region_state(self.region_sel, ctx.pixels_per_point());
-                self.toast = Some((
-                    self.lang.strings().region_selected.to_string(),
-                    Instant::now(),
-                ));
+            } else if let Some(sel) = self.region_sel.take() {
+                // 松开:只保留选区,不立即保存;之后「存图/复制」只作用于选区
+                self.region_armed = false;
+                let r = Rect::from_two_pos(sel.start, sel.cur);
+                if r.width() >= 4.0 && r.height() >= 4.0 {
+                    self.region_sel = Some(RegionSel { start: r.min, cur: r.max });
+                    self.region_zoom = 1.0;
+                    self.zoom_base = None;
+                    self.region_clean = None;
+                    self.bg_pending = None;
+                    self.bg_pending_sel = None;
+                    self.bg_pending_since = None;
+                    self.debak_started = None;
+                    self.debak_frames = 0;
+                    save_region_state(self.region_sel, ctx.pixels_per_point());
+                    self.toast = Some((
+                        self.lang.strings().region_selected.to_string(),
+                        Instant::now(),
+                    ));
+                    // 框选完成:对原始区域(标注前)后台 OCR,结果回来画序号圆标
+                    self.start_ocr(ctx);
+                }
             }
-        }
     }
 
     /// 当前选区换算成**窗口内**物理像素矩形(无选区返回 None)。
@@ -1281,6 +1462,7 @@ impl App {
         let mut close = false;
         let mut lang_changed = false;
         let mut debug_changed = false;
+        let mut ocr_auto_changed = false;
         // 窗口关闭后再比对,判断存图/去背设置是否需要落盘
         let shot_before = self.shot;
         let bg_before = self.bg_method;
@@ -1291,6 +1473,8 @@ impl App {
             .open(&mut open)
             .resizable(false)
             .collapsible(false)
+            // 模型下载区加进来后内容变长:小屏幕上允许滚动
+            .vscroll(true)
             .pivot(Align2::CENTER_CENTER)
             .default_pos(Pos2::new(lw / 2.0, lh / 2.0))
             .default_width(520.0)
@@ -1402,6 +1586,122 @@ impl App {
                     self.dark_light = dark;
                 }
                 ui.separator();
+                // OCR 文字识别:开关 + 模型状态(框选后自动识别并编号)
+                ui.label(egui::RichText::new(tr.ocr_heading).strong());
+                ui.add_space(2.0);
+                if ui.checkbox(&mut self.ocr_auto, tr.ocr_auto_checkbox).changed() {
+                    ocr_auto_changed = true;
+                }
+                match ocr::find_det() {
+                    Some(p) => ui.label(egui::RichText::new(i18n::fill(
+                        tr.ocr_det_found,
+                        &[p.file_name().and_then(|n| n.to_str()).unwrap_or("det.onnx")],
+                    ))
+                    .weak()),
+                    None => ui.label(egui::RichText::new(tr.ocr_det_missing).color(RED)),
+                };
+                match ocr::find_rec() {
+                    Some(p) => ui.label(egui::RichText::new(i18n::fill(
+                        tr.ocr_rec_found,
+                        &[p.file_name().and_then(|n| n.to_str()).unwrap_or("rec.onnx")],
+                    ))
+                    .weak()),
+                    None => ui.label(egui::RichText::new(tr.ocr_rec_missing).color(RED)),
+                };
+                match ocr::find_dict() {
+                    Some(p) => ui.label(egui::RichText::new(i18n::fill(
+                        tr.ocr_dict_found,
+                        &[p.file_name().and_then(|n| n.to_str()).unwrap_or("dict.txt")],
+                    ))
+                    .weak()),
+                    None => ui.label(egui::RichText::new(tr.ocr_dict_missing).color(RED)),
+                };
+                ui.separator();
+                // 模型下载:魔搭(默认,国内直连)/ HuggingFace;完成自动被发现
+                ui.label(egui::RichText::new(tr.dl_heading).strong());
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr.dl_source_label);
+                    egui::ComboBox::from_id_salt("settings_dl_source")
+                        .selected_text(match self.dl_source {
+                            Source::ModelScope => tr.dl_source_ms,
+                            Source::HuggingFace => tr.dl_source_hf,
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.dl_source, Source::ModelScope, tr.dl_source_ms);
+                            ui.selectable_value(&mut self.dl_source, Source::HuggingFace, tr.dl_source_hf);
+                        });
+                });
+                let snap = download::snapshot();
+                for (kind, name) in [
+                    (ModelKind::IsnetFp16, tr.dl_name_isnet),
+                    (ModelKind::IsnetFp32, tr.dl_name_isnet32),
+                    (ModelKind::OcrDet, tr.dl_name_ocr_det),
+                    (ModelKind::OcrRec, tr.dl_name_ocr_rec),
+                    (ModelKind::OcrDict, tr.dl_name_ocr_dict),
+                ] {
+                    let prog = snap
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .map(|(_, p)| p.clone());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(name).weak().small());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let busy = matches!(
+                                prog.as_ref().map(|p| p.phase),
+                                Some(download::Phase::Queued | download::Phase::Connecting | download::Phase::Downloading)
+                            );
+                            if busy {
+                                if ui.small_button(tr.dl_cancel).clicked() {
+                                    download::cancel(kind);
+                                }
+                            } else if ui.small_button(tr.dl_download).clicked() {
+                                self.dl_seen.retain(|k| *k != kind);
+                                download::start(kind, self.dl_source);
+                            }
+                        });
+                    });
+                    if let Some(p) = prog {
+                        match p.phase {
+                            download::Phase::Downloading => {
+                                let frac = if p.total > 0 {
+                                    p.received as f32 / p.total as f32
+                                } else {
+                                    0.0
+                                };
+                                let label = format!(
+                                    "{:.1} / {:.1} MB",
+                                    p.received as f64 / 1e6,
+                                    p.total as f64 / 1e6
+                                );
+                                ui.add(
+                                    egui::ProgressBar::new(frac)
+                                        .show_percentage()
+                                        .text(label),
+                                );
+                            }
+                            download::Phase::Connecting | download::Phase::Queued => {
+                                ui.label(egui::RichText::new(tr.dl_connecting).weak().small());
+                            }
+                            download::Phase::Done => {
+                                ui.label(egui::RichText::new(i18n::fill(tr.dl_done, &[kind.file_name()])).small());
+                            }
+                            download::Phase::Failed => {
+                                ui.label(egui::RichText::new(i18n::fill(
+                                    tr.dl_failed,
+                                    &[p.error.as_deref().unwrap_or("?")],
+                                ))
+                                .small()
+                                .color(RED));
+                            }
+                            download::Phase::Cancelled => {
+                                ui.label(egui::RichText::new(tr.dl_cancelled).weak().small());
+                            }
+                        }
+                    }
+                }
+                ui.label(egui::RichText::new(tr.dl_dll_tip).weak().small());
+                ui.separator();
                 // 签名章:改动即持久化(下次启动沿用)
                 ui.label(egui::RichText::new(tr.signature_heading).strong());
                 ui.add_space(2.0);
@@ -1419,6 +1719,15 @@ impl App {
                 ui.label(
                     egui::RichText::new(tr.tool_signature).weak(),
                 );
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui.button(tr.sig_draw_btn).clicked() {
+                        self.sig_editor = Some(SigEditor { strokes: Vec::new(), drawing: false });
+                    }
+                    if self.hand_signature.is_some() {
+                        ui.label(egui::RichText::new(tr.tool_hand_signature).weak());
+                    }
+                });
                 ui.add_space(4.0);
                 let mut dbg = self.debug_shot;
                 if ui.checkbox(&mut dbg, tr.debug_checkbox).changed() {
@@ -1451,6 +1760,7 @@ impl App {
         }
         if lang_changed
             || debug_changed
+            || ocr_auto_changed
             || self.shot != shot_before
             || self.bg_method != bg_before
             || self.dark_light != dark_before
@@ -1644,22 +1954,33 @@ impl App {
                         self.canvas.clear();
                     }
                     ui.end_row();
-                    if self.icon_btn(ui, Icon::Print, tr.tool_print, false, false).clicked() {
-                        self.do_print(ctx);
+                    if self
+                        .icon_btn(ui, Icon::Gallery, tr.tool_gallery, self.show_gallery, false)
+                        .clicked()
+                    {
+                        self.show_gallery = !self.show_gallery;
                     }
+                    if self
+                        .icon_btn(ui, Icon::Ocr, tr.tool_ocr, self.show_ocr, false)
+                        .clicked()
+                    {
+                        self.show_ocr = !self.show_ocr;
+                    }
+                    ui.end_row();
                     if self
                         .icon_btn(ui, Icon::Save, tr.tool_save, false, false)
                         .clicked()
                     {
                         self.do_save(ctx);
                     }
-                    ui.end_row();
                     if self
                         .icon_btn(ui, Icon::Copy, tr.tool_copy, false, false)
                         .clicked()
                     {
                         self.do_copy(ctx);
                     }
+                    ui.end_row();
+                    self.tool_icon(ui, Icon::HandSignature, tr.tool_hand_signature, Tool::HandSignature);
                     if self
                         .icon_btn(ui, Icon::Settings, tr.tool_settings, self.show_settings, false)
                         .clicked()
@@ -2113,8 +2434,301 @@ impl App {
         self.start_shot(ShotJob::Copy, ctx);
     }
 
-    fn do_print(&mut self, ctx: &Context) {
-        self.start_shot(ShotJob::Print, ctx);
+    /// 清掉当前 OCR 会话状态(选区被清/重选时)
+    fn clear_ocr(&mut self) {
+        self.ocr_pending = None;
+        self.ocr_badges.clear();
+        self.ocr_lines.clear();
+        self.ocr_failed = false;
+        self.ocr_ran = false;
+    }
+
+    /// 框选完成:从进入标注时冻结的原始画面裁出选区(标注前、无覆盖层),
+    /// 交给 OCR 后台线程;序号圆标等结果回来再画
+    fn start_ocr(&mut self, ctx: &Context) {
+        self.clear_ocr();
+        if !self.ocr_auto {
+            return;
+        }
+        let Some(r) = self.target_region(ctx) else { return };
+        let Some(backdrop) = &self.backdrop_shot else { return };
+        let crop = capture::crop_shot(
+            backdrop,
+            r.left() as i32,
+            r.top() as i32,
+            r.width() as i32,
+            r.height() as i32,
+        );
+        let Some(crop) = crop else { return };
+        if let Some(id) = ocr::submit(crop) {
+            self.ocr_pending = Some(id);
+            self.ocr_ran = true;
+            ctx.request_repaint();
+        }
+    }
+
+    /// 轮询 OCR 结果:文本行 → 序号圆标(逻辑坐标);失败按"缺模型只提示一次"处理
+    fn poll_ocr_job(&mut self, ctx: &Context) {
+        let mut done = None;
+        while let Some(result) = ocr::poll() {
+            if self.ocr_pending == Some(result.id) {
+                done = Some(result);
+                break;
+            }
+        }
+        if self.ocr_pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+        let Some(done) = done else { return };
+        self.ocr_pending = None;
+        // 自动化排查用:POINTTOFIX_GEOM_LOG=1 打印 OCR 耗时与结果行数
+        if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+            eprintln!(
+                "[ocr] took={:.2}s lines={:?}",
+                done.elapsed.as_secs_f32(),
+                done.result.as_ref().map(|l| l.len())
+            );
+        }
+        let tr = self.lang.strings();
+        match done.result {
+            Ok(lines) => {
+                let ppp = ctx.pixels_per_point();
+                self.ocr_badges = lines
+                    .iter()
+                    .map(|l| {
+                        (
+                            Rect::from_min_size(
+                                Pos2::new(l.rect[0] as f32 / ppp, l.rect[1] as f32 / ppp),
+                                Vec2::new(l.rect[2] as f32 / ppp, l.rect[3] as f32 / ppp),
+                            ),
+                            l.no,
+                        )
+                    })
+                    .collect();
+                self.ocr_lines = lines;
+                // 保存早于识别完成:回写那一行
+                if let Some(row) = self.ocr_pending_row.take() {
+                    let text = self
+                        .ocr_lines
+                        .iter()
+                        .map(|l| l.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let json = ocr::lines_to_json(&self.ocr_lines);
+                    let _ = gallery::update_ocr(row, &text, &json, "done");
+                }
+                if self.ocr_lines.is_empty() {
+                    self.set_toast(Ok(tr.ocr_none.to_string()));
+                }
+            }
+            Err(e) => {
+                self.ocr_failed = true;
+                if let Some(row) = self.ocr_pending_row.take() {
+                    let _ = gallery::update_ocr(row, "", "[]", "failed");
+                }
+                match e {
+                    OcrError::ModelMissing => {
+                        if !self.ocr_missing_notified {
+                            self.ocr_missing_notified = true;
+                            self.set_toast(Err(tr.ocr_missing_once.to_string()));
+                        }
+                    }
+                    OcrError::Error(msg) => {
+                        self.set_toast(Err(i18n::fill(tr.ocr_failed, &[&msg])));
+                    }
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// 模型下载状态轮询:终态转 toast(每项只提示一次);忙时节流重绘
+    fn poll_downloads(&mut self, ctx: &Context) {
+        for (kind, p) in download::snapshot() {
+            let terminal = matches!(p.phase, download::Phase::Done | download::Phase::Failed | download::Phase::Cancelled);
+            if !terminal || self.dl_seen.contains(&kind) {
+                continue;
+            }
+            self.dl_seen.push(kind);
+            let tr = self.lang.strings();
+            let name = kind.file_name();
+            match p.phase {
+                download::Phase::Done => self.set_toast(Ok(i18n::fill(tr.dl_done, &[name]))),
+                download::Phase::Failed => self.set_toast(Err(i18n::fill(
+                    tr.dl_failed,
+                    &[p.error.as_deref().unwrap_or("?")],
+                ))),
+                _ => self.set_toast(Ok(tr.dl_cancelled.to_string())),
+            }
+        }
+        if download::is_busy() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    /// 画廊窗口(打开期间每帧调用;操作产生的 toast 由这里转发)
+    fn gallery_ui(&mut self, ctx: &Context) {
+        if !self.show_gallery {
+            return;
+        }
+        let tr = self.lang.strings();
+        if let Some(result) = self.gallery.show(ctx, tr) {
+            self.set_toast(result);
+        }
+    }
+
+    /// OCR 结果窗口:当前截图的带序号文本行 + 复制全部
+    fn ocr_window_ui(&mut self, ctx: &Context) {
+        if !self.show_ocr {
+            return;
+        }
+        let tr = self.lang.strings();
+        let screen = self.screen_logical(ctx);
+        let mut open = true;
+        let mut copy = false;
+        egui::Window::new(tr.ocr_title)
+            .id(Id::unique("ocr_result"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(Pos2::new(screen.x / 2.0, screen.y / 2.0))
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                if self.ocr_pending.is_some() {
+                    ui.label(egui::RichText::new(tr.ocr_running).weak());
+                } else if self.ocr_lines.is_empty() {
+                    ui.label(egui::RichText::new(tr.ocr_none).weak());
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("ocr-result-lines")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for l in &self.ocr_lines {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(gallery::circled(l.no))
+                                            .strong()
+                                            .color(Color32::from_rgb(230, 100, 0)),
+                                    );
+                                    ui.label(&l.text);
+                                });
+                            }
+                        });
+                    copy = ui.button(tr.ocr_copy_all).clicked();
+                }
+            });
+        if copy {
+            let text = self
+                .ocr_lines
+                .iter()
+                .map(|l| l.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let ok = arboard::Clipboard::new()
+                .and_then(|mut cb| cb.set_text(text))
+                .is_ok();
+            self.set_toast(if ok { Ok(tr.ocr_copied.to_string()) } else { Err("clipboard".into()) });
+        }
+        if !open {
+            self.show_ocr = false;
+        }
+    }
+
+    /// 手绘签名编辑器:模态小窗,拖拽采点,保存时包围盒归一化并落盘
+    fn sig_editor_ui(&mut self, ctx: &Context) {
+        if self.sig_editor.is_none() {
+            return;
+        }
+        // 先把编辑器状态取出来,避免闭包期间同时借用 self 的其它字段
+        let mut editor = self.sig_editor.take().unwrap();
+        let tr = self.lang.strings();
+        let screen = self.screen_logical(ctx);
+        let mut open = true;
+        let (mut clear, mut save, mut cancel) = (false, false, false);
+        egui::Window::new(tr.sig_editor_title)
+            .id(Id::unique("sig_editor"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .pivot(Align2::CENTER_CENTER)
+            .default_pos(Pos2::new(screen.x / 2.0, screen.y / 2.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(352.0);
+                // 签名画布:白底 + 基线;拖拽采点(与自由笔同款最小间距)
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(336.0, 140.0),
+                    egui::Sense::click_and_drag(),
+                );
+                let p = ui.painter();
+                p.rect_filled(rect, 4.0, Color32::WHITE);
+                p.rect_stroke(rect, 4.0, Stroke::new(1.0, STROKE_GRAY), egui::epaint::StrokeKind::Inside);
+                p.line_segment(
+                    [Pos2::new(rect.left() + 12.0, rect.center().y + 28.0), Pos2::new(rect.right() - 12.0, rect.center().y + 28.0)],
+                    Stroke::new(1.0, Color32::from_rgb(210, 210, 210)),
+                );
+                if editor.strokes.is_empty() {
+                    p.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        tr.sig_hint,
+                        FontId::proportional(12.0),
+                        Color32::from_rgb(180, 180, 180),
+                    );
+                }
+                if resp.drag_started() {
+                    editor.strokes.push(vec![resp.interact_pointer_pos().unwrap_or(rect.center())]);
+                    editor.drawing = true;
+                }
+                if editor.drawing && resp.dragged() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let Some(last) = editor.strokes.last_mut() {
+                            if last.last().map(|p| p.distance(pos) > 1.5).unwrap_or(true) {
+                                last.push(pos);
+                            }
+                        }
+                    }
+                }
+                if editor.drawing && resp.drag_stopped() {
+                    editor.drawing = false;
+                }
+                let ink = Stroke::new(2.4, Color32::from_rgb(25, 25, 25));
+                for pts in &editor.strokes {
+                    if pts.len() >= 2 {
+                        p.add(egui::Shape::line(pts.clone(), ink));
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button(tr.sig_clear).clicked() {
+                        clear = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        save = ui.button(egui::RichText::new(tr.sig_save).strong()).clicked();
+                        cancel = ui.button(tr.sig_cancel).clicked();
+                    });
+                });
+            });
+        if clear {
+            editor.strokes.clear();
+        }
+        if save {
+            match normalize_strokes(&editor.strokes) {
+                Some(strokes) => {
+                    save_hand_signature(&strokes);
+                    self.hand_signature = Some(strokes);
+                    self.set_toast(Ok(self.lang.strings().sig_saved.to_string()));
+                    return; // 已保存:不归还编辑器
+                }
+                None => {
+                    self.set_toast(Err(self.lang.strings().sig_empty.to_string()));
+                }
+            }
+        }
+        if cancel || !open {
+            return; // 关闭:不归还编辑器
+        }
+        self.sig_editor = Some(editor);
     }
 
     /// 启动一次截图:底图 BitBlt + egui 帧缓冲合成(含墨迹;调试模式含工具条)
@@ -2200,7 +2814,10 @@ impl App {
         let prefix = if had_region { tr.region_prefix } else { "" };
         match job {
             ShotJob::Save => {
-                let (path, size) = save_shot_image(&shot, self.shot)?;
+                let (path, size, hash) = save_shot_image(&shot, self.shot)?;
+                // 画廊入库:缩略图 + 内容指纹 + 来源软件 + OCR 文本
+                // (DB 失败只记日志,保存本身已成功,不影响用户)
+                self.insert_gallery_row(&shot, &path, size, &hash, had_region);
                 let detail = format!("{} ({})", path.display(), human_size(size));
                 Ok(i18n::fill(tr.saved_tip, &[&detail]))
             }
@@ -2217,10 +2834,70 @@ impl App {
                     .map_err(|e| e.to_string())?;
                 Ok(format!("{prefix}{}", tr.copied_tip))
             }
-            ShotJob::Print => {
-                printing::print_rgba(&shot.rgba, shot.width, shot.height, self.lang)?;
-                Ok(format!("{prefix}{}", tr.printed_tip))
+        }
+    }
+
+    /// 保存成功后入画廊库:缩略图、指纹、来源软件、OCR 文本与状态。
+    /// DB 失败只打日志——用户的文件已经落盘,画廊少一条记录不应报错打扰。
+    fn insert_gallery_row(
+        &mut self,
+        shot: &capture::Shot,
+        path: &std::path::Path,
+        size: u64,
+        hash: &str,
+        had_region: bool,
+    ) {
+        let thumb = gallery::thumbnail_png(shot, 320).ok().and_then(|bytes| {
+            let tdir = path.parent()?.join("thumbs");
+            std::fs::create_dir_all(&tdir).ok()?;
+            // 缩略图永远是 PNG 内容:文件名必须跟扩展名一致,否则 image::open 解码失败
+            let stem = path.file_stem()?.to_string_lossy();
+            let tpath = tdir.join(format!("{stem}.png"));
+            std::fs::write(&tpath, &bytes).ok().map(|_| tpath)
+        });
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_string();
+        let lines_json = ocr::lines_to_json(&self.ocr_lines);
+        let ocr_text = self
+            .ocr_lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 状态:无选区=off;OCR 还在跑=pending(结果回来后回写);失败=failed;其余=done
+        let status = if !had_region || !self.ocr_ran {
+            "off"
+        } else if self.ocr_pending.is_some() {
+            "pending"
+        } else if self.ocr_failed {
+            "failed"
+        } else {
+            "done"
+        };
+        let row = gallery::NewShot {
+            created_at: now_ms(),
+            file: path,
+            thumb: thumb.as_deref(),
+            format: &ext,
+            width: shot.width,
+            height: shot.height,
+            file_size: size as i64,
+            content_hash: hash,
+            app_name: self.source_app.as_deref(),
+            ocr_text: &ocr_text,
+            ocr_lines_json: &lines_json,
+            ocr_status: status,
+        };
+        match gallery::insert(row) {
+            Ok(id) => {
+                if status == "pending" {
+                    self.ocr_pending_row = Some(id);
+                }
             }
+            Err(e) => eprintln!("[gallery] 入库失败: {e}"),
         }
     }
 
@@ -2252,7 +2929,7 @@ impl App {
         });
     }
 
-    /// 持久化界面状态(位置 / 调试模式 / 语言 / 存图格式与清晰度 / 去背方式)
+    /// 持久化界面状态(位置 / 调试模式 / 语言 / 存图格式与清晰度 / 去背方式 / OCR 开关)
     fn save_state(&self) {
         save_ui_state(
             self.standby_px,
@@ -2263,6 +2940,7 @@ impl App {
             self.bg_method,
             self.dark_light,
             &self.signature,
+            self.ocr_auto,
         );
     }
 
@@ -2295,6 +2973,109 @@ fn bg_issue_text(tr: &i18n::Strings, issue: Option<&BgIssue>) -> String {
         Some(BgIssue::Error(e)) => e.clone(),
         None => String::new(),
     }
+}
+
+/// OCR 序号圆标:橙色实心圆 + 白字,中心放在文本框左上角(画进导出图)
+fn draw_badges(p: &egui::Painter, badges: &[(Rect, u32)]) {
+    for (r, no) in badges {
+        let c = Pos2::new(r.left(), r.top());
+        p.circle_filled(c, 9.0, Color32::from_rgb(245, 124, 0));
+        p.circle_stroke(c, 10.0, Stroke::new(1.5, Color32::WHITE));
+        p.text(c, Align2::CENTER_CENTER, no.to_string(), FontId::proportional(11.0), Color32::WHITE);
+    }
+}
+
+/// 笔画归一化:取包围盒,较长边缩到 0..1,短边居中;退化(没画出内容)返回 None
+fn normalize_strokes(strokes: &[Vec<Pos2>]) -> Option<Vec<Vec<Pos2>>> {
+    let pts: Vec<Pos2> = strokes.iter().flatten().copied().collect();
+    if pts.len() < 4 {
+        return None;
+    }
+    let (mut minx, mut miny) = (f32::MAX, f32::MAX);
+    let (mut maxx, mut maxy) = (f32::MIN, f32::MIN);
+    for p in &pts {
+        minx = minx.min(p.x);
+        miny = miny.min(p.y);
+        maxx = maxx.max(p.x);
+        maxy = maxy.max(p.y);
+    }
+    let w = maxx - minx;
+    let h = maxy - miny;
+    if w < 5.0 || h < 5.0 {
+        return None;
+    }
+    let scale = w.max(h);
+    // 短轴居中,保证盖章时按 size 铺满正方形也居中
+    let off_x = (scale - w) * 0.5;
+    let off_y = (scale - h) * 0.5;
+    Some(
+        strokes
+            .iter()
+            .filter(|s| s.len() >= 2)
+            .map(|s| {
+                s.iter()
+                    .map(|p| {
+                        Pos2::new(
+                            (p.x - minx + off_x) / scale,
+                            (p.y - miny + off_y) / scale,
+                        )
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// 手绘签名模板路径(%APPDATA%\pointtofix\signature_strokes.txt)
+fn hand_signature_path() -> std::path::PathBuf {
+    std::env::var("APPDATA")
+        .map(|p| std::path::PathBuf::from(p).join("pointtofix").join("signature_strokes.txt"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("pointtofix_signature.txt"))
+}
+
+/// 模板落盘:每笔画一行 `x,y x,y …`(归一化坐标;手写解析,与 ui.txt 同风格)
+fn save_hand_signature(strokes: &[Vec<Pos2>]) {
+    let mut text = String::new();
+    for s in strokes {
+        for (i, p) in s.iter().enumerate() {
+            if i > 0 {
+                text.push(' ');
+            }
+            text.push_str(&format!("{:.4},{:.4}", p.x, p.y));
+        }
+        text.push('\n');
+    }
+    if let Some(dir) = hand_signature_path().parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(hand_signature_path(), text);
+}
+
+fn load_hand_signature() -> Option<Vec<Vec<Pos2>>> {
+    let text = std::fs::read_to_string(hand_signature_path()).ok()?;
+    let strokes: Vec<Vec<Pos2>> = text
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter_map(|pair| {
+                    let mut it = pair.split(',');
+                    let x: f32 = it.next()?.parse().ok()?;
+                    let y: f32 = it.next()?.parse().ok()?;
+                    Some(Pos2::new(x, y))
+                })
+                .collect()
+        })
+        .filter(|s: &Vec<Pos2>| s.len() >= 2)
+        .collect();
+    (!strokes.is_empty()).then_some(strokes)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Shift 约束:直线/箭头吸附到 45° 方向
@@ -2358,6 +3139,7 @@ fn load_ui_state() -> (
     BgMethod,
     bool,
     String,
+    bool,
 ) {
     let mut standby = None;
     let mut toolbar = None;
@@ -2367,6 +3149,7 @@ fn load_ui_state() -> (
     let mut bg_method = BgMethod::default();
     let mut dark_light = true;
     let mut signature = String::new();
+    let mut ocr_auto = true;
     if let Ok(text) = std::fs::read_to_string(ui_state_path()) {
         // 用记事本/PowerShell 改过这个文件时可能带 UTF-8 BOM,会让第一行的键名匹配失败
         for line in text.trim_start_matches('\u{feff}').lines() {
@@ -2396,6 +3179,8 @@ fn load_ui_state() -> (
                 }
             } else if line == "dark_light=0" {
                 dark_light = false;
+            } else if line == "ocr_auto=0" {
+                ocr_auto = false;
             } else if let Some(v) = line.strip_prefix("signature=") {
                 // 签名整行取值(可含空格);换行符是 TextEdit 不该出现的脏数据,忽略
                 signature = v.trim_end().trim_start().to_string();
@@ -2411,6 +3196,7 @@ fn load_ui_state() -> (
         bg_method,
         dark_light,
         signature,
+        ocr_auto,
     )
 }
 
@@ -2423,6 +3209,7 @@ fn save_ui_state(
     bg_method: BgMethod,
     dark_light: bool,
     signature: &str,
+    ocr_auto: bool,
 ) {
     let path = ui_state_path();
     if let Some(dir) = path.parent() {
@@ -2447,6 +3234,9 @@ fn save_ui_state(
     text.push_str(&format!("bg_method={}\n", bg_method.code()));
     if !dark_light {
         text.push_str("dark_light=0\n");
+    }
+    if !ocr_auto {
+        text.push_str("ocr_auto=0\n");
     }
     if !signature.is_empty() {
         // 签名放最后一行整行存:内容可含空格,不参与键值冲突
@@ -2524,19 +3314,16 @@ fn encode_shot(shot: &capture::Shot, set: ShotSettings) -> Result<(&'static str,
     }
 }
 
-/// 存一张截图到桌面,返回文件路径与文件大小(字节)
-fn save_shot_image(shot: &capture::Shot, set: ShotSettings) -> Result<(std::path::PathBuf, u64), String> {
-    let dir = std::env::var("USERPROFILE")
-        .map(|p| std::path::PathBuf::from(p).join("Desktop"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+/// 存一张截图到画廊目录(%APPDATA%\pointtofix\gallery),
+/// 文件名带可读时间戳(同秒冲突加 _2);返回 (路径, 字节数, sha256)
+fn save_shot_image(shot: &capture::Shot, set: ShotSettings) -> Result<(std::path::PathBuf, u64, String), String> {
+    let dir = gallery::gallery_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let (ext, bytes) = encode_shot(shot, set)?;
-    let path = dir.join(format!("pointtofix_{ts}.{ext}"));
+    let path = gallery::unique_file_name(&dir, ext);
     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-    Ok((path, bytes.len() as u64))
+    let hash: String = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    Ok((path, bytes.len() as u64, hash))
 }
 
 /// 时间章文本:点击那刻的本地日期+整点。中日文用"…23时"式,其余用"2026-10-30 23:00"式
@@ -2608,6 +3395,28 @@ impl eframe::App for App {
                 );
             }
         }
+        // 托盘事件:× 之后窗口隐藏,靠回调线程 request_repaint 唤醒到这里
+        if let Some(t) = &self.tray {
+            for ev in t.poll() {
+                match ev {
+                    TrayEvent::Show => {
+                        if self.mode == Mode::Standby {
+                            if self.hidden {
+                                self.hidden = false;
+                                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                            }
+                            ctx.send_viewport_cmd(ViewportCommand::Focus);
+                        }
+                    }
+                    TrayEvent::Exit => {
+                        // 隐藏状态下也能退出:Visible(false) 不影响视口命令
+                        ctx.send_viewport_cmd(ViewportCommand::Close);
+                    }
+                }
+            }
+        }
+        // 模型下载进度:完成/失败 toast + 忙时节流重绘
+        self.poll_downloads(&ctx);
         // 截图/去背帧:隐藏界面元素;去背期间额外隐藏标注层(图层隔离,标注不进背景处理)
         let debaking = self.debak_started.is_some();
         self.shot_skip_ink = debaking;
@@ -2615,9 +3424,15 @@ impl eframe::App for App {
             (self.shot_phase == ShotPhase::NeedFrame && !self.debug_shot) || debaking;
         self.poll_shot(&ctx);
         self.poll_bg_job(&ctx);
+        self.poll_ocr_job(&ctx);
         match self.mode {
             Mode::Standby => self.standby_ui(&ctx, ui),
             Mode::Active => self.active_ui(&ctx),
+        }
+        if self.mode == Mode::Active && !self.shot_skip_chrome {
+            self.gallery_ui(&ctx);
+            self.ocr_window_ui(&ctx);
+            self.sig_editor_ui(&ctx);
         }
         if !self.shot_skip_chrome {
             self.toast_ui(&ctx);

@@ -1,12 +1,13 @@
 [package]
 name = "pointtofix"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "PointToFix — 屏幕标注工具(Rust 重写版,REA 练手项目)"
 
 [dependencies]
 eframe = "0.37"
-image = { version = "0.25", default-features = false, features = ["png"] }
+# png/webp 都开:存图用编码,画廊预览需要解码 webp
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
 # 存图默认走 WebP:libwebp 同时提供有损(清晰度可调)与无损两种编码
 webp = "0.3"
 arboard = "3"
@@ -21,14 +22,25 @@ ort = { version = "2.0.0-rc.15", default-features = false, features = [
     "load-dynamic",
     "api-17",
 ] }
+# 系统托盘(关闭 = 驻留托盘):Tauri 同款实现,事件走全局回调线程,
+# 窗口隐藏后仍能收到菜单/点击事件(手写 Shell_NotifyIcon 需要子类化窗口,太脆)
+tray-icon = "0.21"
+# 画廊存储:SQLite + FTS5。bundled = 静态编译进二进制(零外部 DLL),
+# bundled 构建自带 FTS5 编译开关;WAL 模式允许外部 RAG 软件只读并发访问
+rusqlite = { version = "0.37", features = ["bundled"] }
+# 画廊删除图片:移入系统回收站(误删可恢复)
+trash = "5"
+# 画廊入库的内容指纹(RAG 侧去重用)
+sha2 = "0.10"
 windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_UI_WindowsAndMessaging",
-    "Win32_Graphics_Printing",
     "Win32_Globalization",
-    "Win32_Storage_Xps",
     "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_System_Console",
+    "Win32_Networking_WinHttp",
 ] }
 
 [build-dependencies]

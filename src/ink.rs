@@ -28,6 +28,8 @@ pub enum Tool {
     Time,
     /// 签名章(文字在设置里自定义)
     Signature,
+    /// 手绘签名章(模板在设置里手绘一次;矢量笔画,点画布盖章)
+    HandSignature,
 }
 
 #[derive(Clone, Copy)]
@@ -48,6 +50,10 @@ pub enum Ink {
     Stamp { pos: Pos2, size: f32, color: Color32, check: bool },
     /// 印章:圆角边框 + 文本(时间章/签名章共用,文本在点击那刻定格)
     Seal { pos: Pos2, size: f32, color: Color32, text: String },
+    /// 手绘签名章:strokes 是模板的归一化笔画(0..1,基于包围盒缩放),
+    /// 渲染时按 size 平移/缩放。存矢量而非位图:与其它 Ink 同一条渲染/撤销/擦除管线,
+    /// 模板持久化只是一个坐标点文本文件,纹理生命周期不用管。
+    Signature { pos: Pos2, size: f32, color: Color32, strokes: Vec<Vec<Pos2>> },
     /// 实心图形被橡皮擦切开后剩下的填充薄片(只填充、不描边):
     /// epaint 不支持带洞的填充,用扫描线薄片近似圆形缺口。
     FillRect { a: Pos2, b: Pos2, color: Color32 },
@@ -193,6 +199,23 @@ impl Ink {
                     p.galley(r.min + Vec2::new(pad_x, pad_y), galley, *color);
                 }
             }
+            Ink::Signature { pos, size, color, strokes } => {
+                let w = (*size * 0.07).max(1.5);
+                let stroke = Stroke::new(w, *color);
+                // strokes 归一化 0..1(基于模板包围盒),pos 是左上角
+                let map = |p: &Pos2| *pos + Vec2::new(p.x, p.y) * *size;
+                for pts in strokes {
+                    if pts.len() < 2 {
+                        continue;
+                    }
+                    let scaled: Vec<Pos2> = pts.iter().map(map).collect();
+                    p.add(Shape::line(scaled.clone(), stroke));
+                    // 圆头端帽(Shape::line 是平头)
+                    for pt in [scaled.first(), scaled.last()].into_iter().flatten() {
+                        p.circle_filled(*pt, w * 0.5, *color);
+                    }
+                }
+            }
             Ink::FillRect { a, b, color } => {
                 p.add(Shape::rect_filled(
                     Rect::from_two_pos(*a, *b),
@@ -219,6 +242,9 @@ impl Ink {
             Ink::Text { text, .. } => text.trim().is_empty(),
             Ink::Stamp { .. } => false,
             Ink::Seal { text, .. } => text.trim().is_empty(),
+            Ink::Signature { strokes, .. } => {
+                strokes.iter().all(|s| s.len() < 2)
+            }
             Ink::FillRect { a, b, .. } => {
                 (a.x - b.x).abs() < 0.5 || (a.y - b.y).abs() < 0.5
             }
@@ -286,6 +312,16 @@ impl Ink {
                     *pos + Vec2::new(w, h),
                     *pos + Vec2::new(w * 0.5, h * 0.5),
                 ]
+            }
+            Ink::Signature { pos, size, strokes, .. } => {
+                // 按渲染规则把归一化点映射回画布(采样限 64 点/笔画,擦除命中够用)
+                let mut v = vec![*pos, *pos + Vec2::splat(*size)];
+                for pts in strokes.iter() {
+                    for p in pts.iter().take(64) {
+                        v.push(*pos + Vec2::new(p.x, p.y) * *size);
+                    }
+                }
+                v
             }
             Ink::FillRect { a, b, .. } => {
                 let r = Rect::from_two_pos(*a, *b);
@@ -547,7 +583,7 @@ fn erase_shape(shape: Ink, from: Pos2, to: Pos2, radius: f32, out: &mut Vec<Ink>
                 out.push(Ink::Poly { pts, color });
             }
         }
-        other @ (Ink::Text { .. } | Ink::Stamp { .. } | Ink::Seal { .. }) => {
+        other @ (Ink::Text { .. } | Ink::Stamp { .. } | Ink::Seal { .. } | Ink::Signature { .. }) => {
             if !other.hits_eraser(from, to, radius) {
                 out.push(other);
             }

@@ -29,6 +29,8 @@ pub enum Icon {
     TimeStamp,
     /// 签名章工具(印章)
     Signature,
+    /// 手绘签名章工具(手写笔迹)
+    HandSignature,
     Region,
     /// 选区去背(背景变白)
     Debak,
@@ -38,7 +40,10 @@ pub enum Icon {
     UndoArrow,
     /// 清空全部
     ClearAll,
-    Print,
+    /// 画廊(双栏窗口)
+    Gallery,
+    /// OCR 识别结果(文本行)
+    Ocr,
     Save,
     Copy,
 }
@@ -380,56 +385,81 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32, bg: Color32) {
                 );
             }
         }
-        Icon::Print => {
-            // 打印机:纸张在机身后面,机身用按钮底色遮挡纸张下半部分
-            let paper = Rect::from_min_max(
-                Pos2::new(c.x - h * 0.65, c.y - h),
-                Pos2::new(c.x + h * 0.65, c.y - h * 0.3),
+        Icon::HandSignature => {
+            // 手写笔迹:一条像签名的连续折线 + 下方一道下划线
+            let pts = [
+                Pos2::new(c.x - h * 0.9, c.y + h * 0.45),
+                Pos2::new(c.x - h * 0.45, c.y - h * 0.55),
+                Pos2::new(c.x - h * 0.1, c.y + h * 0.35),
+                Pos2::new(c.x + h * 0.2, c.y - h * 0.75),
+                Pos2::new(c.x + h * 0.5, c.y + h * 0.25),
+                Pos2::new(c.x + h * 0.9, c.y - h * 0.45),
+            ];
+            p.add(Shape::line(pts.to_vec(), Stroke::new(2.2, color)));
+            p.line_segment(
+                [
+                    Pos2::new(c.x - h * 0.85, c.y + h * 0.8),
+                    Pos2::new(c.x + h * 0.85, c.y + h * 0.8),
+                ],
+                Stroke::new(1.6, color),
             );
-            p.rect_filled(paper, CornerRadius::same(1), bg);
+        }
+        Icon::Gallery => {
+            // 相册:相框 + 山形照片 + 右上角小太阳
+            let r = Rect::from_min_max(
+                Pos2::new(c.x - h, c.y - h * 0.85),
+                Pos2::new(c.x + h, c.y + h * 0.85),
+            );
             p.rect_stroke(
-                paper,
-                CornerRadius::same(1),
-                Stroke::new(1.4, color),
-                eframe::epaint::StrokeKind::Inside,
-            );
-            let body = Rect::from_min_max(
-                Pos2::new(c.x - h, c.y - h * 0.5),
-                Pos2::new(c.x + h, c.y + h * 0.35),
-            );
-            p.rect_filled(body, CornerRadius::same(2), bg);
-            p.rect_stroke(
-                body,
+                r,
                 CornerRadius::same(2),
                 Stroke::new(1.8, color),
                 eframe::epaint::StrokeKind::Inside,
             );
-            // 进纸口
-            p.line_segment(
-                [
-                    Pos2::new(c.x - h * 0.62, c.y - h * 0.2),
-                    Pos2::new(c.x + h * 0.62, c.y - h * 0.2),
+            p.add(Shape::convex_polygon(
+                vec![
+                    Pos2::new(c.x - h * 0.7, c.y + h * 0.6),
+                    Pos2::new(c.x - h * 0.15, c.y - h * 0.25),
+                    Pos2::new(c.x + h * 0.25, c.y + h * 0.6),
                 ],
-                Stroke::new(1.4, color),
+                color,
+                Stroke::NONE,
+            ));
+            p.add(Shape::convex_polygon(
+                vec![
+                    Pos2::new(c.x + h * 0.05, c.y + h * 0.6),
+                    Pos2::new(c.x + h * 0.5, c.y - h * 0.05),
+                    Pos2::new(c.x + h * 0.75, c.y + h * 0.6),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+            p.circle_filled(Pos2::new(c.x + h * 0.45, c.y - h * 0.45), h * 0.14, color);
+        }
+        Icon::Ocr => {
+            // 文本识别:文档轮廓 + 三行字线 + 左下角放大镜(识别=读出来)
+            let r = Rect::from_min_max(
+                Pos2::new(c.x - h * 0.95, c.y - h),
+                Pos2::new(c.x + h * 0.95, c.y + h),
             );
-            // 出纸(在机身前面)
-            let out = Rect::from_min_max(
-                Pos2::new(c.x - h * 0.6, c.y + h * 0.28),
-                Pos2::new(c.x + h * 0.6, c.y + h * 0.9),
-            );
-            p.rect_filled(out, CornerRadius::same(1), bg);
             p.rect_stroke(
-                out,
-                CornerRadius::same(1),
-                Stroke::new(1.4, color),
+                r,
+                CornerRadius::same(2),
+                Stroke::new(1.7, color),
                 eframe::epaint::StrokeKind::Inside,
             );
+            for (i, w) in [1.2f32, 1.2, 0.9].iter().enumerate() {
+                let y = c.y - h * 0.45 + i as f32 * h * 0.5;
+                p.line_segment(
+                    [Pos2::new(c.x - h * 0.6, y), Pos2::new(c.x - h * 0.6 + h * w, y)],
+                    Stroke::new(1.6, color),
+                );
+            }
+            let lens = Pos2::new(c.x + h * 0.35, c.y + h * 0.35);
+            p.circle_stroke(lens, h * 0.4, Stroke::new(1.8, color));
             p.line_segment(
-                [
-                    Pos2::new(c.x - h * 0.3, c.y + h * 0.56),
-                    Pos2::new(c.x + h * 0.3, c.y + h * 0.56),
-                ],
-                Stroke::new(1.1, color),
+                [lens + Vec2::new(h * 0.28, h * 0.28), lens + Vec2::new(h * 0.55, h * 0.55)],
+                Stroke::new(2.0, color),
             );
         }
         Icon::Save => {
