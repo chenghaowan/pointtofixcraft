@@ -1616,6 +1616,12 @@ impl App {
                     .weak()),
                     None => ui.label(egui::RichText::new(tr.ocr_dict_missing).color(RED)),
                 };
+                // OCR 与去背共用同一个 onnxruntime.dll:缺失时这里也要亮红灯,
+                // 否则用户只会在框选后收到一句报错 toast,不知道缺的是什么
+                match isnet::find_dll() {
+                    Some(_) => ui.label(egui::RichText::new(tr.bg_runtime_found).weak()),
+                    None => ui.label(egui::RichText::new(tr.bg_runtime_missing).color(RED)),
+                };
                 ui.separator();
                 // 模型下载:魔搭(默认,国内直连)/ HuggingFace;完成自动被发现
                 ui.label(egui::RichText::new(tr.dl_heading).strong());
@@ -1644,20 +1650,33 @@ impl App {
                         .iter()
                         .find(|(k, _)| *k == kind)
                         .map(|(_, p)| p.clone());
+                    // 该文件已在搜索路径里就绪:不显示下载按钮,只在行尾标注
+                    let ready = match kind {
+                        ModelKind::IsnetFp16 | ModelKind::IsnetFp32 => {
+                            isnet::find_in_dirs(kind.file_name()).is_some()
+                        }
+                        ModelKind::OcrDet => ocr::find_det().is_some(),
+                        ModelKind::OcrRec => ocr::find_rec().is_some(),
+                        ModelKind::OcrDict => ocr::find_dict().is_some(),
+                    };
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(name).weak().small());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let busy = matches!(
-                                prog.as_ref().map(|p| p.phase),
-                                Some(download::Phase::Queued | download::Phase::Connecting | download::Phase::Downloading)
-                            );
-                            if busy {
-                                if ui.small_button(tr.dl_cancel).clicked() {
-                                    download::cancel(kind);
+                            if ready {
+                                ui.label(egui::RichText::new(tr.dl_ready).weak().small());
+                            } else {
+                                let busy = matches!(
+                                    prog.as_ref().map(|p| p.phase),
+                                    Some(download::Phase::Queued | download::Phase::Connecting | download::Phase::Downloading)
+                                );
+                                if busy {
+                                    if ui.small_button(tr.dl_cancel).clicked() {
+                                        download::cancel(kind);
+                                    }
+                                } else if ui.small_button(tr.dl_download).clicked() {
+                                    self.dl_seen.retain(|k| *k != kind);
+                                    download::start(kind, self.dl_source);
                                 }
-                            } else if ui.small_button(tr.dl_download).clicked() {
-                                self.dl_seen.retain(|k| *k != kind);
-                                download::start(kind, self.dl_source);
                             }
                         });
                     });

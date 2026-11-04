@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal EnableExtensions
 title PointToFix 便携版打包
 
-rem 纯 Rust 程序:直接输出「exe + onnxruntime.dll + ISNet 模型」的便携目录,不再用 Enigma 加壳。
+rem 纯 Rust 程序:输出「exe(推理库已内置)+ 可选 ISNet 模型」的便携目录,不再用 Enigma 加壳。
 rem 目标目录可以直接拷到任何 Windows 10/11 x64 机器上运行;没有 DLL/模型时仅键控去背可用。
 
 cd /d "%~dp0"
@@ -35,10 +35,7 @@ echo.
 echo ========================================
 echo  2/3 组装便携目录
 echo ========================================
-set "ORT_DLL="
 set "ISNET_MODEL="
-if exist "%MODELDIR%\onnxruntime.dll" set "ORT_DLL=%MODELDIR%\onnxruntime.dll"
-if not defined ORT_DLL if exist "%ROOT%onnxruntime.dll" set "ORT_DLL=%ROOT%onnxruntime.dll"
 
 rem 按优先级挑一个模型: 用户命名 -^> fp16 -^> fp32 -^> int8 -^> 任意 isnet*.onnx
 for %%N in (isnet-general-uxe.onnx isnet-general-use-fp16.onnx isnet-general-use.onnx isnet-general-use-int8.onnx isnet-general-use-q8.onnx) do (
@@ -57,12 +54,9 @@ if errorlevel 1 (
     goto :fail
 )
 
-if defined ORT_DLL (
-    copy /y "%ORT_DLL%" "%PKGDIR%\onnxruntime.dll" >nul
-    echo   推理库: onnxruntime.dll
-) else (
-    echo   [提示] 没有 models\onnxruntime.dll,便携版只有键控去背
-)
+rem onnxruntime.dll 已在编译期嵌入 exe(缺 DLL 找不到时运行期自动释放到 %APPDATA%),
+rem 便携包不再单独带 DLL;models\ 里没有 dll 只影响重新构建,不影响已编译的 exe
+echo   推理库: 已内置在 exe 中
 
 if defined ISNET_MODEL (
     for %%F in ("%ISNET_MODEL%") do copy /y "%%~fF" "%PKGDIR%\%%~nxF" >nul
@@ -74,7 +68,7 @@ echo   需要 AI 去背时先运行: python scripts\fetch_isnet.py
 
 rem 附一份简短说明,方便拷给别人(用 PowerShell 写,避免 bat 括号转义问题)
 powershell -NoProfile -Command ^
-  "$lines = @('PointToFix 便携版','','直接双击 pointtofix.exe 运行,不需要安装。','','文件说明:','  pointtofix.exe          主程序','  onnxruntime.dll         ONNX Runtime 推理库,ISNet 去背用','  isnet*.onnx             ISNet 去背模型','','删掉 dll / onnx 后程序仍可使用,但选区去背只剩键控模式。','设置 Ctrl+I 里可以切换 自动 / 键控 / ISNet。','');" ^
+  "$lines = @('PointToFix 便携版','','直接双击 pointtofix.exe 运行,不需要安装。','','文件说明:','  pointtofix.exe          主程序(ONNX Runtime 推理库已内置,首次用到时自动释放)','  isnet*.onnx             ISNet 去背模型(可选)','删掉 onnx 模型后程序仍可使用,但选区去背只剩键控模式。','设置 Ctrl+I 里可以切换 自动 / 键控 / ISNet。','');" ^
   "[IO.File]::WriteAllLines('%PKGDIR%\使用说明.txt', $lines, (New-Object Text.UTF8Encoding $true))"
 
 echo.

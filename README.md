@@ -29,11 +29,11 @@ Grab the portable build from the [**Releases**](https://github.com/chenghaowan/p
 
 | File | Contents | Size |
 | --- | --- | --- |
-| `pointtofix-craft-portable.zip` | `pointtofix.exe` + `onnxruntime.dll` | ~13 MB (36 MB unpacked) |
+| `pointtofix-craft-portable.zip` | `pointtofix.exe` (ONNX Runtime embedded, extracted on first use) | ~14 MB (~39 MB unpacked) |
 
 Unzip anywhere and double-click `pointtofix.exe`. No installer, no VC++ redistributable, no registry writes — the tool is a single statically linked executable. Settings live in `%APPDATA%\pointtofix\`.
 
-> **AI background removal is optional.** The download ships without the ISNet model. Keying-based background removal works out of the box; to enable the AI engine, drop an ISNet model into `models\` (or the program folder) — see [Background removal](#background-removal).
+> **AI background removal is optional.** The download ships without the ISNet model (the ONNX Runtime library is embedded in the exe and self-extracts when needed). Keying-based background removal works out of the box; to enable the AI engine, drop an ISNet model into `models\` (or the program folder) — see [Background removal](#background-removal).
 
 ## Features
 

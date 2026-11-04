@@ -278,7 +278,32 @@ pub(crate) fn find_in_dirs(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// 在常见位置查找 onnxruntime.dll
+/// build.rs 生成:仓库有 models/onnxruntime.dll 时为 Some(字节),否则 None
+include!(concat!(env!("OUT_DIR"), "/embedded_dll.rs"));
+
+/// 嵌入式推理库的落地路径:磁盘各处都找不到 DLL 时,把编译期嵌进 exe 的字节
+/// 释放到 %APPDATA%\pointtofix\runtime\ 再加载(写临时名后改名,防并发读到半截文件)。
+/// 目标已存在且大小一致时直接复用,不重写 19MB。
+fn embedded_dll_path() -> Option<PathBuf> {
+    let bytes = ORT_DLL_EMBEDDED?;
+    let dir = std::env::var("APPDATA")
+        .map(|p| PathBuf::from(p).join("pointtofix").join("runtime"))
+        .unwrap_or_else(|_| PathBuf::from("pointtofix_runtime"));
+    let path = dir.join(DLL_NAME);
+    let same = std::fs::metadata(&path)
+        .map(|m| m.len() == bytes.len() as u64)
+        .unwrap_or(false);
+    if same {
+        return Some(path);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let tmp = dir.join(format!("{DLL_NAME}.tmp"));
+    std::fs::write(&tmp, bytes).ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+
+/// 在常见位置查找 onnxruntime.dll;都没有则释放内嵌的兜底副本
 pub fn find_dll() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("POINTTOFIX_ORT_DLL") {
         let p = PathBuf::from(p);
@@ -286,7 +311,7 @@ pub fn find_dll() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    find_in_dirs(DLL_NAME)
+    find_in_dirs(DLL_NAME).or_else(embedded_dll_path)
 }
 
 /// 在常见位置查找 ISNet 模型;按 [`MODEL_NAMES`] 的优先级挑第一个

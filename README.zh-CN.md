@@ -212,7 +212,7 @@ cargo build --release  # 发布版:target/release/pointtofix.exe(约 16 MB)
 
 **打包就是 `cargo build --release`**:主程序是**单文件 exe**(约 17 MB),直接拷走即可;
 键控去背、标注、存图/复制/打印全都不依赖额外文件(libwebp 静态链入,字体运行时从
-`C:\Windows\Fonts` 读取)。只有 **ISNet AI 去背**需要旁边放 `onnxruntime.dll` 和模型,
+`C:\Windows\Fonts` 读取)。只有 **ISNet AI 去背**需要模型(`onnxruntime.dll` 推理库已内置在 exe 里,缺 DLL 时自动释放),
 没有它们时「自动/键控」模式照常工作。release 版声明了
 `windows_subsystem = "windows"`(见 `src/main.rs`),双击**不会弹控制台**;debug 构建仍保留控制台,
 方便看 `POINTTOFIX_GEOM_LOG` 等日志。`Cargo.toml` 的 release profile 已开 `strip` 与 thin LTO。
@@ -222,7 +222,7 @@ cargo build --release  # 发布版:target/release/pointtofix.exe(约 16 MB)
 release + LTO 首次约 5 分钟)。
 可选:本地 `.cargo/config.toml` 可配 rsproxy 镜像加速(该文件不随仓库分发,按需自建)。
 
-ISNet 模型 + `onnxruntime.dll` 不随仓库分发,放到程序目录、`models\` 或
+ISNet 模型不随仓库分发(`onnxruntime.dll` 已内置 exe);模型放到程序目录、`models\` 或
 `%APPDATA%\pointtofix\models` 任意一处即可。推荐直接从魔搭下载现成的 fp16 版:
 
 ```bash
