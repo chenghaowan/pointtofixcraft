@@ -56,6 +56,8 @@ const TOOLBAR_BG: (u8, u8, u8, u8) = (238, 238, 240, 250);
 const STROKE_GRAY: Color32 = Color32::from_rgb(176, 176, 176);
 const DARK_TEXT: Color32 = Color32::from_rgb(55, 71, 79);
 const RED: Color32 = Color32::from_rgb(211, 47, 47);
+/// 未装推理服务属自愈状态(会自动后台下载),用琥珀色提醒而非红色报错
+const AMBER: Color32 = Color32::from_rgb(230, 145, 30);
 const SELECT_FILL: Color32 = Color32::from_rgb(144, 202, 249);
 const HOVER_FILL: Color32 = Color32::from_rgb(224, 231, 240);
 
@@ -1556,6 +1558,13 @@ impl App {
                             );
                         });
                 });
+                // 推理服务状态:ISNet 去背与 OCR 优先走 WanAI Runtime;未装会自动
+                // 后台下载(自愈),不算错误;下面的本地模型/推理库只是回退路径
+                if crate::airuntime::installed() {
+                    ui.label(egui::RichText::new(tr.bg_service_found).weak());
+                } else {
+                    ui.label(egui::RichText::new(tr.bg_service_missing).color(AMBER));
+                }
                 match isnet::find_model() {
                     Some(path) => {
                         let name = path
@@ -1645,6 +1654,7 @@ impl App {
                     (ModelKind::OcrDet, tr.dl_name_ocr_det),
                     (ModelKind::OcrRec, tr.dl_name_ocr_rec),
                     (ModelKind::OcrDict, tr.dl_name_ocr_dict),
+                    (ModelKind::AiRuntime, tr.dl_name_runtime),
                 ] {
                     let prog = snap
                         .iter()
@@ -1658,6 +1668,7 @@ impl App {
                         ModelKind::OcrDet => ocr::find_det().is_some(),
                         ModelKind::OcrRec => ocr::find_rec().is_some(),
                         ModelKind::OcrDict => ocr::find_dict().is_some(),
+                        ModelKind::AiRuntime => crate::airuntime::installed(),
                     };
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(name).weak().small());

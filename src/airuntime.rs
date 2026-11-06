@@ -1,7 +1,8 @@
 //! AI Runtime 接入:模型推理集中服务(localhost HTTP)。
 //!
 //! 流程:需要模型(去背/OCR)时 → 若开关开启 → 尝试 HTTP 调用 WanAI Runtime;
-//! 服务未运行则自动拉起(独立进程,等待就绪);任何失败返回 None,**静默回退本地推理**。
+//! 服务未运行则自动拉起(独立进程,等待就绪);未安装则后台自动下载安装
+//! (设置面板可手动触发);任何失败返回 None,**静默回退本地推理**。
 //!
 //! 配置:`%APPDATA%\pointtofix\ai_runtime.json`
 //! ```json
@@ -13,6 +14,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::capture::Shot;
@@ -21,6 +23,9 @@ use crate::capture::Shot;
 const STARTUP_WAIT: Duration = Duration::from_secs(30);
 /// 单次推理超时(本地大模型 CPU 推理 + 大图传输)
 const CALL_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// "找不到 exe → 触发一次后台下载"的防重标志(每进程只 kick 一次)
+static AUTO_KICKED: AtomicBool = AtomicBool::new(false);
 
 /// 极简 JSON 字符串值提取:取 "key" 后第一个带引号的值
 fn json_str(src: &str, key: &str) -> Option<String> {
@@ -80,7 +85,7 @@ fn cfg_exe() -> String {
     json_str(&read_cfg_raw(), "exe").unwrap_or_default()
 }
 
-/// 查找 ai-runtime.exe(env > 配置 > exe 旁 > 开发目录)
+/// 查找 ai-runtime.exe(env > 配置 > exe 旁 > 本程序下载安装的副本 > 开发目录)
 fn find_exe(cfg_exe: &str) -> Option<PathBuf> {
     if !cfg_exe.is_empty() {
         let p = PathBuf::from(cfg_exe);
@@ -102,17 +107,32 @@ fn find_exe(cfg_exe: &str) -> Option<PathBuf> {
             }
         }
     }
-    // 开发机便利:兄弟仓库的构建产物
-    for probe in [
-        "D:\\claw.forvia\\rs-aiprivaderCraft\\target\\release\\ai-runtime.exe",
-        "D:\\claw.forvia\\rs-aiprivaderCraft\\target\\debug\\ai-runtime.exe",
-    ] {
-        let p = PathBuf::from(probe);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+    // 本程序下载安装的副本(排在开发目录探针之前:下载完成立即生效)
+    installed_exe()
+        // 开发机便利:兄弟仓库的构建产物
+        .or_else(|| {
+            for probe in [
+                "D:\\claw.forvia\\rs-aiprivaderCraft\\target\\release\\ai-runtime.exe",
+                "D:\\claw.forvia\\rs-aiprivaderCraft\\target\\debug\\ai-runtime.exe",
+            ] {
+                let p = PathBuf::from(probe);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+            None
+        })
+}
+
+/// 下载队列安装的副本(%APPDATA%\pointtofix\runtime\ai-runtime\)
+fn installed_exe() -> Option<PathBuf> {
+    let p = crate::download::runtime_dir().join("ai-runtime").join("ai-runtime.exe");
+    p.is_file().then_some(p)
+}
+
+/// 统一推理服务是否已安装(UI「已就绪」标注用)
+pub fn installed() -> bool {
+    find_exe(&cfg_exe()).is_some()
 }
 
 fn healthy(addr: &str) -> bool {
@@ -127,11 +147,24 @@ fn ensure_running(addr: &str) -> bool {
         return true;
     }
     let Some(exe) = find_exe(&cfg_exe()) else {
-        eprintln!("[ai-runtime] 未找到 ai-runtime.exe,回退本地推理");
+        // 没装:后台下载一次 WanAI Runtime(约 16 MB),本次仍回退本地推理;
+        // 下载完成后下一次调用即可拉起服务。UI 也可在设置里手动触发。
+        eprintln!("[ai-runtime] 未找到 ai-runtime.exe,本次回退本地推理");
+        if !AUTO_KICKED.swap(true, Ordering::Relaxed) {
+            eprintln!("[ai-runtime] 后台下载 WanAI Runtime(Gitee 直连,失败换 GitHub)…");
+            let _ = crate::download::start(
+                crate::download::ModelKind::AiRuntime,
+                crate::download::Source::ModelScope, // AiRuntime 忽略来源,占位
+            );
+        }
         return false;
     };
-    // config.yaml 与 exe 同目录(部署形态);工作目录启动
+    // config.yaml 与 exe 同目录(部署形态);config 里 model_dir/cache_dir 是相对
+    // 路径,以 exe 所在目录为工作目录才能解析到 models/onnxruntime.dll
     let mut cmd = std::process::Command::new(&exe);
+    if let Some(parent) = exe.parent() {
+        cmd.current_dir(parent);
+    }
     let cfg = exe.parent().map(|d| d.join("config.yaml"));
     if let Some(cfg) = cfg.filter(|c| c.is_file()) {
         cmd.arg("--config").arg(cfg);

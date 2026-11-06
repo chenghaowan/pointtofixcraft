@@ -3171,11 +3171,12 @@ dependencies = [
 
 [[package]]
 name = "pointtofix"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arboard",
  "eframe",
  "embed-resource",
+ "flate2",
  "image",
  "ort",
  "raw-window-handle",

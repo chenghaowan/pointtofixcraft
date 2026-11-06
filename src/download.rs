@@ -24,6 +24,9 @@ pub enum ModelKind {
     OcrDet,
     OcrRec,
     OcrDict,
+    /// WanAI Runtime(rs-aiprivaderCraft)便携包 zip:去背/OCR 的统一推理服务,
+    /// 下载后自动解包到 runtime_dir()/ai-runtime(见 install_runtime)
+    AiRuntime,
 }
 
 /// 下载源:魔搭国内直连(默认);HuggingFace 走系统代理
@@ -61,6 +64,7 @@ impl ModelKind {
             ModelKind::OcrDet => "ppocrv5_mobile_det.onnx",
             ModelKind::OcrRec => "ppocrv5_mobile_rec.onnx",
             ModelKind::OcrDict => "ppocrv5_dict.txt",
+            ModelKind::AiRuntime => "ai-runtime.zip",
         }
     }
 }
@@ -69,6 +73,11 @@ impl ModelKind {
 /// 路径按仓库标准 resolve 形式给出,失败时 UI 显示 HTTP 错误、可切回魔搭。
 /// 词典的 jsdelivr 直链国内外都可达(PaddleOCR 官方仓库镜像),两种源共用。
 pub fn download_url(kind: ModelKind, source: Source) -> &'static str {
+    // WanAI Runtime 两端 Release 都有公开便携包;忽略 Source 选择,固定 Gitee 直连,
+    // 失败由 worker 自动换 GitHub(fallback_url)
+    if kind == ModelKind::AiRuntime {
+        return AI_RUNTIME_URL_GITEE;
+    }
     if kind == ModelKind::OcrDict {
         return "https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@main/ppocr/utils/dict/ppocrv5_dict.txt";
     }
@@ -98,7 +107,17 @@ pub fn download_url(kind: ModelKind, source: Source) -> &'static str {
             "https://huggingface.co/ilaylow/PP_OCRv5_mobile_onnx/resolve/main/PP-OCRv5_mobile_rec.onnx"
         }
         (ModelKind::OcrDict, _) => unreachable!(),
+        (ModelKind::AiRuntime, _) => unreachable!(),
     }
+}
+
+/// WanAI Runtime 便携包直链:两端 Release 各一份(Gitee 国内直连,GitHub 走系统代理)
+const AI_RUNTIME_URL_GITEE: &str = "https://gitee.com/chenghao_wan/rs-aiprivader-craft/releases/download/v0.1.0/wanai-runtime-v0.1.0-windows-x64.zip";
+const AI_RUNTIME_URL_GITHUB: &str = "https://github.com/chenghaowan/rs-aiprivader-craft/releases/download/v0.1.0/wanai-runtime-v0.1.0-windows-x64.zip";
+
+/// 主源失败时的镜像;目前只有 AiRuntime 需要(Gitee → GitHub)
+fn fallback_url(kind: ModelKind) -> Option<&'static str> {
+    (kind == ModelKind::AiRuntime).then_some(AI_RUNTIME_URL_GITHUB)
 }
 
 /// 模型落地目录(%APPDATA%\pointtofix\models;已在 isnet 的搜索白名单里)
@@ -107,6 +126,15 @@ pub fn models_dir() -> PathBuf {
         .map(|p| PathBuf::from(p).join("pointtofix"))
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     base.join("models")
+}
+
+/// runtime 目录(%APPDATA%\pointtofix\runtime):isnet 的内嵌 DLL 解包用其根,
+/// WanAI Runtime 整套装在 ai-runtime 子目录(互不覆盖)
+pub fn runtime_dir() -> PathBuf {
+    let base = std::env::var("APPDATA")
+        .map(|p| PathBuf::from(p).join("pointtofix"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    base.join("runtime")
 }
 
 struct Job {
@@ -179,7 +207,11 @@ fn worker_loop(rx: Receiver<Cmd>) {
         match rx.recv() {
             Ok(Cmd::Enqueue { kind, source }) => {
                 let url = download_url(kind, source).to_string();
-                let dest = models_dir().join(kind.file_name());
+                let dest = match kind {
+                    // AiRuntime 的 zip 落 runtime 目录(模型仍落 models)
+                    ModelKind::AiRuntime => runtime_dir().join(kind.file_name()),
+                    _ => models_dir().join(kind.file_name()),
+                };
                 {
                     let mut st = state().lock().unwrap();
                     if st.busy_kind(kind) {
@@ -228,7 +260,18 @@ fn pump_queue() {
     std::thread::Builder::new()
         .name("pointtofix-download-io".into())
         .spawn(move || {
-            let result = http_download(kind, &job.url, &job.dest, &flag);
+            let mut result = http_download(kind, &job.url, &job.dest, &flag);
+            // 主源失败换镜像再试一次(目前只有 AiRuntime:Gitee → GitHub)
+            if result.is_err() {
+                if let Some(fb) = fallback_url(kind).filter(|fb| *fb != job.url) {
+                    eprintln!("[download] 主源失败,重试镜像: {fb}");
+                    result = http_download(kind, fb, &job.dest, &flag);
+                }
+            }
+            // AiRuntime:zip 下载成功后立即解包安装,失败按下载失败上报
+            if result.is_ok() && kind == ModelKind::AiRuntime {
+                result = install_runtime(&job.dest);
+            }
             let mut st = state().lock().unwrap();
             st.running = None;
             match result {
@@ -243,6 +286,21 @@ fn pump_queue() {
             pump_queue();
         })
         .ok();
+}
+
+/// 解包安装 WanAI Runtime:zip → runtime_dir()/ai-runtime/(strip 顶层版本目录)。
+/// 覆盖安装时先清空旧目录;成功后删 zip 省空间。
+fn install_runtime(zip: &Path) -> Result<(), String> {
+    let dest = runtime_dir().join("ai-runtime");
+    let _ = std::fs::remove_dir_all(&dest);
+    std::fs::create_dir_all(&dest).map_err(|e| format!("创建 runtime 目录失败: {e}"))?;
+    crate::zipmin::extract(zip, &dest, 1)?;
+    if !dest.join("ai-runtime.exe").is_file() {
+        return Err("解包完成但未找到 ai-runtime.exe(包内容不符?)".into());
+    }
+    let _ = std::fs::remove_file(zip);
+    eprintln!("[download] WanAI Runtime 已安装到 {}", dest.display());
+    Ok(())
 }
 
 /// 排一个下载任务;已在队列/下载中时返回 false
@@ -598,5 +656,104 @@ mod tests {
         assert!(ModelKind::IsnetFp16.file_name().starts_with("isnet"));
         assert!(ModelKind::OcrDet.file_name().starts_with("ppocr"));
         assert!(ModelKind::OcrDict.file_name().starts_with("ppocr"));
+    }
+
+    /// 真机端到端:POINTTOFIX_TEST_NET=1 时走完整链路 ——
+    /// Gitee 直链探测 → 下载队列拿 WanAI Runtime 便携包 → 解包安装到
+    /// runtime_dir()/ai-runtime → 拉起安装副本 → /ocr 与 /remove-bg 真实推理
+    /// (服务首次调用会自动下载它自己的 PP-OCR/ISNet 模型,约 110 MB)。
+    /// 结束时恢复配置并杀掉拉起的服务。
+    #[test]
+    fn airuntime_e2e_install_and_serve() {
+        use crate::capture::Shot;
+        use std::time::Instant;
+        if std::env::var("POINTTOFIX_TEST_NET").is_err() {
+            return;
+        }
+
+        // 1) 直链探测(下载层 WinHTTP 会自动跟随 302,这里只验证可达与体积)
+        let (status, len) = probe_url(AI_RUNTIME_URL_GITEE).expect("探测 Gitee 直链失败");
+        assert_eq!(status, 200, "Gitee Release 直链应 200");
+        assert!(len > 10_000_000, "便携包应约 16MB,实际 {len}");
+
+        // 2) 走真实下载队列(含失败换 GitHub、下载后解包安装)
+        assert!(start(ModelKind::AiRuntime, Source::ModelScope), "入队失败");
+        let t0 = Instant::now();
+        loop {
+            let phase = snapshot()
+                .into_iter()
+                .find(|(k, _)| *k == ModelKind::AiRuntime)
+                .map(|(_, p)| p.phase);
+            if matches!(phase, Some(Phase::Done)) {
+                break;
+            }
+            if matches!(phase, Some(Phase::Failed)) || t0.elapsed() > std::time::Duration::from_secs(300) {
+                panic!("AiRuntime 下载/安装未完成(阶段 {phase:?},耗时 {:?})", t0.elapsed());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let install = runtime_dir().join("ai-runtime");
+        assert!(install.join("ai-runtime.exe").is_file(), "解包后应有 ai-runtime.exe");
+        assert!(install.join("config.yaml").is_file());
+        assert!(install.join("models").join("onnxruntime.dll").is_file());
+        assert!(!runtime_dir().join("ai-runtime.zip").is_file(), "安装成功后 zip 应删除");
+
+        // 3) 端到端:配置指向默认端口 → 拉起「安装副本」(而非开发目录产物)→ 推理
+        let _guard = E2eGuard::install(cfg_for_test());
+        std::process::Command::new("taskkill")
+            .args(["/F", "/IM", "ai-runtime.exe"])
+            .output()
+            .ok();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let shot = Shot { width: 96, height: 48, rgba: vec![255; 96 * 48 * 4] };
+        // OCR:白图 → 服务首调自动下载它的 PP-OCR 模型 → 返回 lines JSON(空行也算通;
+        // try_ocr_lines 契约:返回剥离 "lines" 键后的顶层数组文本)
+        let ocr = crate::airuntime::try_ocr_lines(&shot);
+        let ocr = ocr.expect("OCR 应走通服务(失败会回退本地返回 None)");
+        assert!(ocr.trim_start().starts_with('['), "OCR 应返回顶层数组,实际: {ocr}");
+        // 去背:alpha mask 合成白底,输出尺寸与输入一致
+        let out = crate::airuntime::try_remove_bg(&shot);
+        assert!(out.is_some(), "remove-bg 应走通服务(失败会回退本地返回 None)");
+        assert_eq!(out.unwrap().len(), shot.rgba.len(), "remove-bg 输出应与输入同尺寸");
+    }
+
+    /// 测试期写真实配置文件的快照(原内容存在则记下,结束时恢复)
+    fn cfg_for_test() -> (std::path::PathBuf, Option<Vec<u8>>) {
+        let dir = std::env::var("APPDATA")
+            .map(|p| std::path::PathBuf::from(p).join("pointtofix"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = dir.join("ai_runtime.json");
+        let saved = std::fs::read(&cfg).ok();
+        std::fs::write(&cfg, r#"{"enabled":true,"addr":"127.0.0.1:17800","exe":""}"#).ok();
+        (cfg, saved)
+    }
+
+    /// 测试结束(含 panic 展开)恢复 ai_runtime.json 并杀掉拉起的服务
+    struct E2eGuard {
+        cfg: std::path::PathBuf,
+        saved: Option<Vec<u8>>,
+    }
+    impl E2eGuard {
+        fn install((cfg, saved): (std::path::PathBuf, Option<Vec<u8>>)) -> Self {
+            Self { cfg, saved }
+        }
+    }
+    impl Drop for E2eGuard {
+        fn drop(&mut self) {
+            match &self.saved {
+                Some(bytes) => {
+                    let _ = std::fs::write(&self.cfg, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.cfg);
+                }
+            }
+            std::process::Command::new("taskkill")
+                .args(["/F", "/IM", "ai-runtime.exe"])
+                .output()
+                .ok();
+        }
     }
 }

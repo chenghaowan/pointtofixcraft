@@ -23,6 +23,7 @@ mod ink;
 mod isnet;
 mod ocr;
 mod tray;
+mod zipmin;
 
 use eframe::egui;
 

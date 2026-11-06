@@ -42,6 +42,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Console",
     "Win32_Networking_WinHttp",
 ] }
+# zip 解包(WanAI Runtime 便携包下载后解压):flate2 已在依赖树内(image→png/tiff
+# 拉入),加为直接依赖零新增二进制成本;zip 目录解析手写在 zipmin.rs
+flate2 = "1"
 
 [build-dependencies]
 # 把 assets/app.ico 编进 PE 资源(资源管理器/任务栏显示自定义图标)
