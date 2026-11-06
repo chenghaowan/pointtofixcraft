@@ -10,6 +10,7 @@
 // 方便看 POINTTOFIX_GEOM_LOG 等调试钩子的输出。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod airuntime;
 mod app;
 mod bgremove;
 mod capture;

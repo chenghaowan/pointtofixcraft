@@ -290,6 +290,11 @@ fn run_job(job: &Job, slot: &mut ModelSlot) -> (Option<Vec<u8>>, BgEngine, Optio
             .unwrap_or_else(|| keying_whiten(&job.shot, job.dark_light).rgba)
     };
 
+    // ---- AI Runtime 集中服务优先(拉起+HTTP),失败静默回退本地 ISNet ----
+    if let Some(out) = crate::airuntime::try_remove_bg(&job.shot) {
+        return (Some(out), BgEngine::Isnet, None);
+    }
+
     let Some(path) = isnet::find_model() else {
         return if explicit {
             (None, BgEngine::Isnet, Some(BgIssue::ModelMissing))

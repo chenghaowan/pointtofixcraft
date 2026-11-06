@@ -243,6 +243,18 @@ fn run_job(
     job: &Job,
     cached: &mut Option<(PathBuf, PathBuf, Vec<String>, OcrSessions)>,
 ) -> Result<Vec<OcrLine>, OcrError> {
+    // ---- AI Runtime 集中服务优先(拉起+HTTP),失败静默回退本地 PP-OCRv5 ----
+    if let Some(json) = crate::airuntime::try_ocr_lines(&job.shot) {
+        let lines = lines_from_json(&json);
+        if !lines.is_empty() {
+            return Ok(lines);
+        }
+        // 空结果可能是真"没文字",也可能是服务端异常:交给本地路径再判一次
+        if json.contains("\"lines\"") {
+            return Ok(lines);
+        }
+    }
+
     let (Some(det_path), Some(rec_path), Some(dict_path)) =
         (find_det(), find_rec(), find_dict())
     else {
