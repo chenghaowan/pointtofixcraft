@@ -396,6 +396,9 @@ pub(crate) fn http_download_file(
         if session.is_null() {
             return Err(last_err("WinHttpOpen"));
         }
+        // 默认无接收超时:对端停滞时读循环会永远挂住(实测 GitHub 附件经代理
+        // 大文件停滞)。接收超时是单次读操作的,正常流式下载不受影响
+        let _ = WinHttpSetTimeouts(session, 10_000, 10_000, 30_000, 15_000);
         let result = open_connect(session, progress, secure, &host, &path, dest, cancel);
         let _ = WinHttpCloseHandle(session);
         result
@@ -620,6 +623,8 @@ pub fn http_get_text(url: &str) -> Result<String, String> {
         if session.is_null() {
             return Err(last_err("WinHttpOpen"));
         }
+        // 同 http_download_file:对端停滞不能永远挂住检查线程
+        let _ = WinHttpSetTimeouts(session, 10_000, 10_000, 30_000, 15_000);
         let result = (|| -> Result<String, String> {
             let hconnect = WinHttpConnect(
                 session,

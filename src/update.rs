@@ -164,17 +164,17 @@ fn check_gitee_html() -> Result<Option<UpdateInfo>, String> {
     }
 }
 
-/// 依次查各源:GitHub API(走系统代理)→ Gitee HTML(国内直连)。
+/// 依次查各源:Gitee HTML(国内直连,最快)→ GitHub API(走系统代理)。
 /// 全失败才报错;任一源成功即返回(有新版 Some(info),无新版 None)。
 pub fn check() -> Result<Option<UpdateInfo>, String> {
     let mut errs: Vec<String> = Vec::new();
-    match check_one(GITHUB_API) {
-        Ok(found) => return Ok(found),
-        Err(e) => errs.push(format!("GitHub: {e}")),
-    }
     match check_gitee_html() {
         Ok(found) => return Ok(found),
         Err(e) => errs.push(format!("Gitee: {e}")),
+    }
+    match check_one(GITHUB_API) {
+        Ok(found) => return Ok(found),
+        Err(e) => errs.push(format!("GitHub: {e}")),
     }
     Err(errs.join("; "))
 }
@@ -274,10 +274,24 @@ fn run_download(info: UpdateInfo, cancel: std::sync::Arc<AtomicBool>) {
             Progress { phase, received, total, error };
     };
     let zip_path = update_dir().join("pointtofix-craft-portable.zip");
-    let result =
-        download::http_download_file(&info.zip_url, &zip_path, &cancel, &|r, t| {
+    // 双端直链按序尝试:Gitee 直连优先(实测快且稳),GitHub 走系统代理——
+    // 实测(2026-11-07)部分代理下 GitHub 附件大文件会停滞在几十 KB 不动,所以只能当兜底
+    let gitee_url = format!("{GITEE_DOWNLOAD_BASE}/{}/{}", info.version, ZIP_ASSET);
+    let mut candidates = vec![gitee_url];
+    if info.zip_url != candidates[0] {
+        candidates.push(info.zip_url.clone());
+    }
+    let mut result = Err("没有可用的下载地址".to_string());
+    for url in &candidates {
+        set(Phase::Connecting, 0, 0, None);
+        result = download::http_download_file(url, &zip_path, &cancel, &|r, t| {
             set(Phase::Downloading, r, t, None)
         });
+        if result.is_ok() || cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        // 失败(含停滞超时?WinHTTP 自身会报错)→ 换下一个源
+    }
     match result {
         Err(e) if e == "__cancelled__" => set(Phase::Cancelled, 0, 0, None),
         Err(e) => set(Phase::Failed, 0, 0, Some(e)),
