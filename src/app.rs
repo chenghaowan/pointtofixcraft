@@ -595,6 +595,9 @@ impl App {
     }
 
     fn enter_active(&mut self, ctx: &Context) {
+        if std::env::var("POINTTOFIX_KEY_LOG").is_ok() {
+            eprintln!("[mode] enter_active");
+        }
         self.pending_entry = false;
         self.mode = Mode::Active;
         self.region_zoom = 1.0;
@@ -671,7 +674,11 @@ impl App {
         }
     }
 
-    fn exit_active(&mut self, ctx: &Context) {
+    fn exit_active(&mut self, ctx: &Context, reason: &str) {
+        // 诊断:模式退出埋点(POINTTOFIX_KEY_LOG 开启时输出)
+        if std::env::var("POINTTOFIX_KEY_LOG").is_ok() {
+            eprintln!("[mode] exit_active: {reason}");
+        }
         // 保存选区供下次启动恢复
         save_region_state(self.region_sel, ctx.pixels_per_point());
         self.canvas.clear();
@@ -955,6 +962,13 @@ impl App {
         }
 
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+        // 诊断:主键按下埋点(定位幽灵点击的坐标)
+        if std::env::var("POINTTOFIX_KEY_LOG").is_ok()
+            && ctx.input(|i| i.pointer.primary_pressed())
+        {
+            let p = ctx.input(|i| i.pointer.interact_pos());
+            eprintln!("[ptr] click at {p:?} over_egui={}", ctx.is_pointer_over_egui());
+        }
         let over_ui = ctx.is_pointer_over_egui();
         let editing = self.text_edit.is_some();
         let down = ctx.input(|i| i.pointer.button_down(PointerButton::Primary));
@@ -997,7 +1011,7 @@ impl App {
             } else {
                 self.canvas.current = None;
                 self.drawing = false;
-                self.exit_active(ctx);
+                self.exit_active(ctx, "esc");
             }
             return;
         }
@@ -2008,7 +2022,7 @@ impl App {
                     )
                     .clicked()
                 {
-                    self.exit_active(ctx);
+                    self.exit_active(ctx, "done-btn");
                 }
                 ui.add_space(2.0 * scale);
 
