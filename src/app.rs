@@ -32,6 +32,7 @@ use crate::ink::{freehand, with_alpha, Canvas, Ink, Spec, Tool};
 use crate::isnet;
 use crate::ocr::{self, OcrError};
 use crate::tray::{self, TrayEvent};
+use crate::update::{self, UiState};
 
 pub const STANDBY_SIZE: Vec2 = Vec2::new(132.0, 96.0);
 const BAR_WIDTH: f32 = 96.0;
@@ -169,6 +170,14 @@ pub struct App {
     magnifier: bool,
     zoom: f32,
     mag_tex: Option<egui::TextureHandle>,
+    /// 待机面板标题前的 logo(内嵌 assets/pointtofixcraft.png,首次待机帧解码)
+    logo: Option<egui::TextureHandle>,
+    /// 应用内升级(设置 → 关于):检查/下载/就绪状态机
+    upd: UiState,
+    /// 当前这次检查是不是启动时的自动检查(自动检查失败保持沉默)
+    upd_auto: bool,
+    /// 自动检查的触发时刻(每次会话一次;None = 已触发或不自动查)
+    upd_auto_at: Option<Instant>,
     // 设置(语言 + 关于)
     show_settings: bool,
     lang: Lang,
@@ -326,6 +335,12 @@ impl App {
             magnifier: false,
             zoom: 2.5,
             mag_tex: None,
+            logo: None,
+            upd: UiState::Idle,
+            upd_auto: false,
+            // 直入标注模式(START_ACTIVE)不自动检查:全屏演示中不弹提醒
+            upd_auto_at: (std::env::var("POINTTOFIX_START_ACTIVE").is_err())
+                .then(|| Instant::now() + Duration::from_secs(2)),
             show_settings: false,
             lang,
             signature,
@@ -721,8 +736,25 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::StartDrag);
                 }
                 // 顶行:标题 + 右上角关闭(×)
+                // 标题前的 logo:内嵌 PNG,首帧解码成纹理,尺寸对齐 12pt 标题
+                if self.logo.is_none() {
+                    if let Ok(img) = image::load_from_memory(include_bytes!("../assets/pointtofixcraft.png")) {
+                        let img = img.into_rgba8();
+                        let (w, h) = img.dimensions();
+                        self.logo = Some(ctx.load_texture(
+                            "logo",
+                            ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &img.into_raw()),
+                            TextureOptions::LINEAR,
+                        ));
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.add_space(6.0);
+                    if let Some(tex) = self.logo.as_ref() {
+                        ui.add(
+                            egui::Image::new(tex).fit_to_exact_size(egui::vec2(14.0, 14.0)),
+                        );
+                    }
                     ui.label(egui::RichText::new("PointToFix").strong().size(12.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(2.0);
@@ -743,8 +775,10 @@ impl App {
                 });
                 ui.add_space(6.0);
                 ui.vertical_centered(|ui| {
+                    // egui 0.37 默认把可点控件悬停光标设成手型;这里要正常箭头
                     if ui
                         .add_sized([104.0, 34.0], egui::Button::new(tr.start_annotate))
+                        .on_hover_cursor(egui::CursorIcon::Default)
                         .clicked()
                     {
                         self.begin_enter_active(ctx);
@@ -1774,6 +1808,100 @@ impl App {
                 );
                 ui.label(tr.app_desc);
                 ui.add_space(4.0);
+                // 应用内升级:检查更新按钮 + 状态/进度(照模型下载行的样式)
+                ui.horizontal(|ui| {
+                    let state = self.upd.clone();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        match state {
+                            UiState::Checking => {
+                                ui.spinner();
+                                ui.label(egui::RichText::new(tr.upd_checking).weak().small());
+                            }
+                            UiState::Available(info) => {
+                                let version = info.version.clone();
+                                let p = update::snapshot();
+                                match p.phase {
+                                    download::Phase::Downloading
+                                    | download::Phase::Connecting => {
+                                        if ui.small_button(tr.dl_cancel).clicked() {
+                                            update::cancel_download();
+                                        }
+                                        let frac = if p.total > 0 {
+                                            p.received as f32 / p.total as f32
+                                        } else {
+                                            0.0
+                                        };
+                                        let label = format!(
+                                            "{:.1} / {:.1} MB",
+                                            p.received as f64 / 1e6,
+                                            p.total as f64 / 1e6
+                                        );
+                                        ui.add(
+                                            egui::ProgressBar::new(frac)
+                                                .desired_width(150.0)
+                                                .show_percentage()
+                                                .text(label),
+                                        );
+                                    }
+                                    _ => {
+                                        if ui.small_button(tr.upd_download_btn).clicked() {
+                                            update::start_download(info);
+                                        }
+                                        ui.label(egui::RichText::new(i18n::fill(
+                                            tr.upd_new_found,
+                                            &[&version],
+                                        ))
+                                        .strong());
+                                    }
+                                }
+                            }
+                            UiState::Ready(info) => {
+                                // 一键升级:替换 exe + 重启;成功即退出,失败留在面板上
+                                if ui
+                                    .small_button(tr.upd_apply_btn)
+                                    .on_hover_text(tr.upd_apply_tip)
+                                    .clicked()
+                                {
+                                    match update::apply_and_restart() {
+                                        Ok(()) => ctx.send_viewport_cmd(ViewportCommand::Close),
+                                        Err(e) => {
+                                            self.upd = UiState::Failed(i18n::fill(
+                                                tr.upd_failed,
+                                                &[&e],
+                                            ));
+                                        }
+                                    }
+                                }
+                                ui.label(egui::RichText::new(i18n::fill(
+                                    tr.upd_new_found,
+                                    &[&info.version],
+                                ))
+                                .strong());
+                            }
+                            state_rest => {
+                                // Idle / UpToDate / Failed:按钮 + 附加状态文本
+                                if ui.small_button(tr.upd_check_btn).clicked() {
+                                    self.upd_auto = false;
+                                    self.upd = UiState::Checking;
+                                    update::start_check();
+                                }
+                                match state_rest {
+                                    UiState::UpToDate => {
+                                        ui.label(
+                                            egui::RichText::new(tr.upd_uptodate).weak().small(),
+                                        );
+                                    }
+                                    UiState::Failed(msg) => {
+                                        ui.label(
+                                            egui::RichText::new(msg).small().color(RED),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
+                });
                 ui.label(egui::RichText::new(tr.shortcuts).weak());
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(tr.tips).weak());
@@ -2593,6 +2721,66 @@ impl App {
         }
         if download::is_busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
+    /// 升级状态轮询:定时自动检查、检查结果分流、下载进度 → 就绪/失败
+    fn poll_update(&mut self, ctx: &Context) {
+        // 启动后到点静默检查(每次会话一次;直入标注模式已在 new() 里排除了)
+        if let Some(at) = self.upd_auto_at {
+            if Instant::now() >= at && self.upd == UiState::Idle {
+                self.upd_auto_at = None;
+                self.upd_auto = true;
+                self.upd = UiState::Checking;
+                update::start_check();
+            }
+        }
+        // 检查结果
+        if let Some(res) = update::poll_check() {
+            self.upd = match res {
+                Ok(Some(info)) => {
+                    // 自动检查命中才弹 toast;手动检查的状态就显示在设置面板里
+                    if self.upd_auto {
+                        let tr = self.lang.strings();
+                        self.set_toast(Ok(i18n::fill(tr.upd_toast_new, &[&info.version])));
+                    }
+                    UiState::Available(info)
+                }
+                Ok(None) => UiState::UpToDate,
+                // 自动检查失败保持沉默(回到 Idle,下次点按钮再查)
+                Err(_) if self.upd_auto => {
+                    self.upd_auto_at = None;
+                    return;
+                }
+                Err(e) => UiState::Failed(e),
+            };
+            self.upd_auto = false;
+        }
+        // 下载中:进度刷新;终态转移(就绪/失败)
+        if let UiState::Available(info) = self.upd.clone() {
+            let p = update::snapshot();
+            match p.phase {
+                download::Phase::Connecting | download::Phase::Downloading => {
+                    ctx.request_repaint_after(Duration::from_millis(120));
+                }
+                // Done 还要看归属:初始/上次残留的 Done 不是这次下载的完成
+                download::Phase::Done
+                    if update::done_version().as_deref() == Some(info.version.as_str()) =>
+                {
+                    let tr = self.lang.strings();
+                    self.upd = UiState::Ready(info);
+                    self.set_toast(Ok(tr.upd_ready.to_string()));
+                }
+                download::Phase::Failed => {
+                    let tr = self.lang.strings();
+                    let msg = i18n::fill(
+                        tr.upd_failed,
+                        &[p.error.as_deref().unwrap_or("?")],
+                    );
+                    self.upd = UiState::Failed(msg);
+                }
+                _ => {} // Cancelled:回到 Available 原状,可再次点下载
+            }
         }
     }
 
@@ -3447,6 +3635,8 @@ impl eframe::App for App {
         }
         // 模型下载进度:完成/失败 toast + 忙时节流重绘
         self.poll_downloads(&ctx);
+        // 升级:定时自动检查 + 检查/下载结果分流
+        self.poll_update(&ctx);
         // 截图/去背帧:隐藏界面元素;去背期间额外隐藏标注层(图层隔离,标注不进背景处理)
         let debaking = self.debak_started.is_some();
         self.shot_skip_ink = debaking;
@@ -3506,8 +3696,11 @@ impl eframe::App for App {
                 self.set_toast(result);
             }
         }
-        // 帧末光标修正:工具条等 Window 内部的 hover 光标只应在 Window 上生效
-        self.post_ui_cursor_fix(&ctx);
+        // 帧末光标修正:工具条等 Window 内部的 hover 光标只应在 Window 上生效。
+        // 只在标注层做;待机面板若也被覆盖,按钮上的正常箭头会被改成十字。
+        if self.mode == Mode::Active {
+            self.post_ui_cursor_fix(&ctx);
+        }
     }
 
     // 透明窗:清屏必须全透明,否则整屏会蒙一层 eframe 默认的半透明黑

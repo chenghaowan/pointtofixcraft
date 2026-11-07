@@ -355,11 +355,25 @@ fn last_err(what: &str) -> String {
     format!("{what}: {}", windows::core::Error::from_thread())
 }
 
+/// 模型队列的下载入口:进度写进共享队列状态(UI 从 snapshot() 轮询)
 fn http_download(
     kind: ModelKind,
     url: &str,
     dest: &Path,
     cancel: &AtomicBool,
+) -> Result<(), String> {
+    http_download_file(url, dest, cancel, &|received, total| {
+        let mut st = state().lock().unwrap();
+        st.set(kind, Phase::Downloading, received, total, None);
+    })
+}
+
+/// 通用 URL→文件下载(update 升级包用,进度走回调,不经模型队列)
+pub(crate) fn http_download_file(
+    url: &str,
+    dest: &Path,
+    cancel: &AtomicBool,
+    progress: &dyn Fn(u64, u64),
 ) -> Result<(), String> {
     use windows::Win32::Networking::WinHttp::*;
     let Some((secure, host, path)) = split_url(url) else {
@@ -382,7 +396,7 @@ fn http_download(
         if session.is_null() {
             return Err(last_err("WinHttpOpen"));
         }
-        let result = open_connect(session, kind, secure, &host, &path, dest, cancel);
+        let result = open_connect(session, progress, secure, &host, &path, dest, cancel);
         let _ = WinHttpCloseHandle(session);
         result
     }
@@ -390,7 +404,7 @@ fn http_download(
 
 fn open_connect(
     session: Handle,
-    kind: ModelKind,
+    progress: &dyn Fn(u64, u64),
     secure: bool,
     host: &str,
     path: &str,
@@ -408,7 +422,7 @@ fn open_connect(
         if hconnect.is_null() {
             return Err(last_err("连接服务器失败(WinHttpConnect)"));
         }
-        let result = send_request(hconnect, kind, secure, path, dest, cancel);
+        let result = send_request(hconnect, progress, secure, path, dest, cancel);
         let _ = WinHttpCloseHandle(hconnect);
         result
     }
@@ -416,7 +430,7 @@ fn open_connect(
 
 fn send_request(
     hconnect: Handle,
-    kind: ModelKind,
+    progress: &dyn Fn(u64, u64),
     secure: bool,
     path: &str,
     dest: &Path,
@@ -437,7 +451,7 @@ fn send_request(
         if hrequest.is_null() {
             return Err(last_err("WinHttpOpenRequest"));
         }
-        let result = read_response(hrequest, kind, dest, cancel);
+        let result = read_response(hrequest, progress, dest, cancel);
         let _ = WinHttpCloseHandle(hrequest);
         result
     }
@@ -445,7 +459,7 @@ fn send_request(
 
 fn read_response(
     hrequest: Handle,
-    kind: ModelKind,
+    progress: &dyn Fn(u64, u64),
     dest: &Path,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
@@ -505,8 +519,7 @@ fn read_response(
             received += read as u64;
             // 进度按 256KB 节流,避免高频加锁
             if received / (256 * 1024) != (received - read as u64) / (256 * 1024) {
-                let mut st = state().lock().unwrap();
-                st.set(kind, Phase::Downloading, received, total, None);
+                progress(received, total);
             }
         }
         drop(file);
@@ -581,6 +594,107 @@ pub fn probe_url(url: &str) -> Result<(u32, u64), String> {
                 Ok((status, len))
             })();
             let _ = WinHttpCloseHandle(hrequest);
+            let _ = WinHttpCloseHandle(hconnect);
+            out
+        })();
+        let _ = WinHttpCloseHandle(session);
+        result
+    }
+}
+
+/// GET 并把响应体读成 UTF-8 文本(升级功能的 release API 查询用;上限 2 MB 防呆)
+pub fn http_get_text(url: &str) -> Result<String, String> {
+    use windows::Win32::Networking::WinHttp::*;
+    let Some((secure, host, path)) = split_url(url) else {
+        return Err(format!("无法解析 URL: {url}"));
+    };
+    let agent = HSTRING::from("Mozilla/5.0 (Windows NT 10.0; Win64; x64) PointToFix/0.3");
+    unsafe {
+        let session = WinHttpOpen(
+            PCWSTR(agent.as_ptr()),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err(last_err("WinHttpOpen"));
+        }
+        let result = (|| -> Result<String, String> {
+            let hconnect = WinHttpConnect(
+                session,
+                PCWSTR(HSTRING::from(&host).as_ptr()),
+                if secure { 443u16 } else { 80u16 },
+                0,
+            );
+            if hconnect.is_null() {
+                return Err(last_err("连接服务器失败(WinHttpConnect)"));
+            }
+            let out = (|| -> Result<String, String> {
+                let flags = if secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
+                let hrequest = WinHttpOpenRequest(
+                    hconnect,
+                    PCWSTR(HSTRING::from("GET").as_ptr()),
+                    PCWSTR(HSTRING::from(&path).as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    std::ptr::null(),
+                    flags,
+                );
+                if hrequest.is_null() {
+                    let r = last_err("WinHttpOpenRequest");
+                    let _ = WinHttpCloseHandle(hconnect);
+                    return Err(r);
+                }
+                let out = (|| -> Result<String, String> {
+                    let policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+                    let _ = WinHttpSetOption(
+                        Some(hrequest),
+                        WINHTTP_OPTION_REDIRECT_POLICY,
+                        Some(std::slice::from_raw_parts(
+                            &policy as *const u32 as *const u8,
+                            std::mem::size_of::<u32>(),
+                        )),
+                    );
+                    WinHttpSendRequest(hrequest, None, None, 0, 0, 0)
+                        .map_err(|e| format!("连接失败(检查网络 / 系统代理): {e}"))?;
+                    WinHttpReceiveResponse(hrequest, std::ptr::null_mut())
+                        .map_err(|e| format!("接收响应失败: {e}"))?;
+                    let status = query_u32(hrequest, WINHTTP_QUERY_STATUS_CODE)?;
+                    if status != 200 {
+                        return Err(format!("HTTP {status}"));
+                    }
+                    let mut body: Vec<u8> = Vec::new();
+                    let mut buf = [0u8; 64 * 1024];
+                    loop {
+                        let mut avail: u32 = 0;
+                        WinHttpQueryDataAvailable(hrequest, &mut avail)
+                            .map_err(|e| format!("查询数据失败: {e}"))?;
+                        if avail == 0 {
+                            break;
+                        }
+                        let want = avail.min(buf.len() as u32);
+                        let mut read: u32 = 0;
+                        WinHttpReadData(
+                            hrequest,
+                            buf.as_mut_ptr() as *mut std::ffi::c_void,
+                            want,
+                            &mut read,
+                        )
+                        .map_err(|e| format!("读取数据失败: {e}"))?;
+                        if read == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&buf[..read as usize]);
+                        if body.len() > 2 * 1024 * 1024 {
+                            return Err("响应过大".to_string());
+                        }
+                    }
+                    String::from_utf8(body).map_err(|_| "响应不是 UTF-8 文本".to_string())
+                })();
+                let _ = WinHttpCloseHandle(hrequest);
+                out
+            })();
             let _ = WinHttpCloseHandle(hconnect);
             out
         })();

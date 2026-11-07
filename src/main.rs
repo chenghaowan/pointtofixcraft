@@ -23,6 +23,7 @@ mod ink;
 mod isnet;
 mod ocr;
 mod tray;
+mod update;
 mod zipmin;
 
 use eframe::egui;
@@ -51,6 +52,8 @@ fn main() -> eframe::Result<()> {
         }
         cli::CliAction::Gui => {}
     }
+    // 升级后的新进程:后台清理上一次升级留下的 *.exe.old / .part(见 update.rs)
+    update::cleanup_startup();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
