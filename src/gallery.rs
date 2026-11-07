@@ -249,7 +249,8 @@ pub fn insert(n: NewShot<'_>) -> Result<i64, String> {
     })
 }
 
-/// OCR 完成晚于保存时回写文本
+/// OCR 完成晚于保存时回写文本(CLI 与外部脚本也可直接 UPDATE shots 表)
+#[allow(dead_code)]
 pub fn update_ocr(id: i64, ocr_text: &str, lines_json: &str, status: &str) -> Result<(), String> {
     with_db(|conn| {
         conn.execute(

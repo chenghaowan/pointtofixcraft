@@ -73,6 +73,8 @@ pub enum Mode {
 enum ShotJob {
     Save,
     Copy,
+    /// OCR 标注内容:捕获帧隐藏底图,帧缓冲里只有墨迹,铺白底后交给 OCR
+    OcrInk,
 }
 
 /// 截图状态机:Idle → NeedFrame(下一帧渲染时决定是否隐藏工具条) → Sent(已请求帧缓冲截图)
@@ -223,6 +225,8 @@ pub struct App {
     shot_skip_chrome: bool,
     /// 去背抓图帧:隐藏标注层(标注是独立矢量层,不进背景处理)
     shot_skip_ink: bool,
+    /// OCR 标注捕获帧:隐藏桌面底图与 region_clean,帧缓冲里只留墨迹
+    shot_skip_backdrop: bool,
     /// 待机面板 / 工具条位置
     shot_sent_wait: u32,
     /// 去背进行中:隐藏覆盖层,等干净画面真正合成上屏后再抓屏(抓屏会连带覆盖层一起抓)
@@ -248,19 +252,13 @@ pub struct App {
     source_app: Option<String>,
     /// 进入标注时冻结的原始屏幕画面(OCR 直接从内存裁选区,不再抓屏)
     backdrop_shot: Option<capture::Shot>,
-    // ---------- OCR(框选完成自动识别 + 序号圆标) ----------
-    /// 框选后自动识别(设置可关;编号依赖它)
-    ocr_auto: bool,
+    // ---------- OCR(手动触发,识别标注内容 + 序号圆标) ----------
     ocr_pending: Option<u64>,
-    /// 保存时 OCR 还没完成:结果回来后回写这一行
-    ocr_pending_row: Option<i64>,
     /// 序号圆标(逻辑坐标 + 编号),烙进导出图
     ocr_badges: Vec<(Rect, u32)>,
     /// 最近一次识别的文本行(结果窗口 + 入库)
     ocr_lines: Vec<ocr::OcrLine>,
     ocr_failed: bool,
-    /// 本次会话是否真的跑过 OCR(恢复的选区没跑过,入库时不算 done)
-    ocr_ran: bool,
     /// 模型缺失只提示一次(避免每张截图都弹)
     ocr_missing_notified: bool,
     show_ocr: bool,
@@ -298,7 +296,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         load_cjk_font(&cc.egui_ctx);
-        let (standby_px, bar_pos, debug_shot, lang, shot, bg_method, dark_light, signature, ocr_auto) =
+        let (standby_px, bar_pos, debug_shot, lang, shot, bg_method, dark_light, signature) =
             load_ui_state();
         let tr = lang.strings();
         let tray = tray::init(&cc.egui_ctx, tr.tray_show, tr.tray_exit);
@@ -363,6 +361,7 @@ impl App {
             shot_slot: Arc::new(Mutex::new(None)),
             shot_skip_chrome: false,
             shot_skip_ink: false,
+            shot_skip_backdrop: false,
             shot_sent_wait: 0,
             debak_started: None,
             debak_frames: 0,
@@ -378,13 +377,10 @@ impl App {
             gallery: gallery::GalleryUi::default(),
             source_app: None,
             backdrop_shot: None,
-            ocr_auto,
             ocr_pending: None,
-            ocr_pending_row: None,
             ocr_badges: Vec::new(),
             ocr_lines: Vec::new(),
             ocr_failed: false,
-            ocr_ran: false,
             ocr_missing_notified: false,
             show_ocr: false,
             dl_seen: Vec::new(),
@@ -618,11 +614,9 @@ impl App {
         // 来源软件:进入标注瞬间沿 Z 序找刚被切走的应用(画廊 app_name 列)
         self.source_app = capture::previous_app_title();
         self.ocr_pending = None;
-        self.ocr_pending_row = None;
         self.ocr_badges.clear();
         self.ocr_lines.clear();
         self.ocr_failed = false;
-        self.ocr_ran = false;
         self.ocr_missing_notified = false;
         self.fit_overlay_to_monitor(ctx);
         self.show_overlay();
@@ -702,7 +696,6 @@ impl App {
         self.show_ocr = false;
         self.sig_editor = None;
         self.ocr_pending = None;
-        self.ocr_pending_row = None;
         self.ocr_badges.clear();
         self.ocr_lines.clear();
         self.ocr_failed = false;
@@ -824,26 +817,32 @@ impl App {
         // 画布画在背景层,工具条等 egui 浮窗在其上
         let canvas_painter = ctx.layer_painter(LayerId::new(Order::Background, Id::unique("canvas")));
         // 冻结的桌面底图:最底层,不随 shot_skip_ink/chrome 隐藏
-        // (去背抓图、存图时它必须留在画面上,否则会抓到黑色/透明)
-        if let Some(tex) = &self.backdrop {
-            canvas_painter.image(
-                tex.id(),
-                Rect::from_min_size(Pos2::ZERO, self.screen_logical(ctx)),
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+        // (去背抓图、存图时它必须留在画面上,否则会抓到黑色/透明);
+        // OCR 标注捕获帧除外——那一刻帧缓冲里只该有墨迹
+        if !self.shot_skip_backdrop {
+            if let Some(tex) = &self.backdrop {
+                canvas_painter.image(
+                    tex.id(),
+                    Rect::from_min_size(Pos2::ZERO, self.screen_logical(ctx)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
         }
         if !self.shot_skip_ink {
             // 去背后的白底画面垫在墨迹下面:去背完成后显示,之后画的标注浮在白底之上。
             // 必须与墨迹画在同一层(且先画),否则 Middle 层的白底会盖住 Background 层的标注。
-            if let (Some(sel), Some(tex)) = (self.region_sel, self.region_clean.as_ref()) {
-                let r = Rect::from_two_pos(sel.start, sel.cur);
-                canvas_painter.image(
-                    tex.id(),
-                    r,
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+            // (OCR 标注捕获帧同样隐藏:去背结果属于截图内容,不算标注)
+            if !self.shot_skip_backdrop {
+                if let (Some(sel), Some(tex)) = (self.region_sel, self.region_clean.as_ref()) {
+                    let r = Rect::from_two_pos(sel.start, sel.cur);
+                    canvas_painter.image(
+                        tex.id(),
+                        r,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
             }
             // 后台去背进行中:在选区中央显示进度(截图帧隐藏,不会进导出图)
             if !self.shot_skip_chrome {
@@ -1392,8 +1391,6 @@ impl App {
                         self.lang.strings().region_selected.to_string(),
                         Instant::now(),
                     ));
-                    // 框选完成:对原始区域(标注前)后台 OCR,结果回来画序号圆标
-                    self.start_ocr(ctx);
                 }
             }
     }
@@ -1512,7 +1509,6 @@ impl App {
         let mut close = false;
         let mut lang_changed = false;
         let mut debug_changed = false;
-        let mut ocr_auto_changed = false;
         // 窗口关闭后再比对,判断存图/去背设置是否需要落盘
         let shot_before = self.shot;
         let bg_before = self.bg_method;
@@ -1643,12 +1639,9 @@ impl App {
                     self.dark_light = dark;
                 }
                 ui.separator();
-                // OCR 文字识别:开关 + 模型状态(框选后自动识别并编号)
+                // OCR 文字识别:模型状态(识别由工具条按钮手动触发,只认标注内容)
                 ui.label(egui::RichText::new(tr.ocr_heading).strong());
                 ui.add_space(2.0);
-                if ui.checkbox(&mut self.ocr_auto, tr.ocr_auto_checkbox).changed() {
-                    ocr_auto_changed = true;
-                }
                 match ocr::find_det() {
                     Some(p) => ui.label(egui::RichText::new(i18n::fill(
                         tr.ocr_det_found,
@@ -1932,7 +1925,6 @@ impl App {
         }
         if lang_changed
             || debug_changed
-            || ocr_auto_changed
             || self.shot != shot_before
             || self.bg_method != bg_before
             || self.dark_light != dark_before
@@ -2136,7 +2128,7 @@ impl App {
                         .icon_btn(ui, Icon::Ocr, tr.tool_ocr, self.show_ocr, false)
                         .clicked()
                     {
-                        self.show_ocr = !self.show_ocr;
+                        self.start_ocr_manual(ctx);
                     }
                     ui.end_row();
                     if self
@@ -2612,31 +2604,20 @@ impl App {
         self.ocr_badges.clear();
         self.ocr_lines.clear();
         self.ocr_failed = false;
-        self.ocr_ran = false;
     }
 
-    /// 框选完成:从进入标注时冻结的原始画面裁出选区(标注前、无覆盖层),
-    /// 交给 OCR 后台线程;序号圆标等结果回来再画
-    fn start_ocr(&mut self, ctx: &Context) {
+    /// 手动触发 OCR(工具条按钮):只识别**用户画上去的标注**(画笔/文字/图章/签名),
+    /// 不识别截图内容——捕获帧隐藏底图,帧缓冲里只剩墨迹,铺白底交给 OCR 线程。
+    /// 有选区时只识别选区内的标注(与存图/复制的语义一致)。
+    fn start_ocr_manual(&mut self, ctx: &Context) {
         self.clear_ocr();
-        if !self.ocr_auto {
+        if self.canvas.shapes.is_empty() && self.canvas.current.is_none() {
+            let tr = self.lang.strings();
+            self.set_toast(Ok(tr.ocr_empty.to_string()));
             return;
         }
-        let Some(r) = self.target_region(ctx) else { return };
-        let Some(backdrop) = &self.backdrop_shot else { return };
-        let crop = capture::crop_shot(
-            backdrop,
-            r.left() as i32,
-            r.top() as i32,
-            r.width() as i32,
-            r.height() as i32,
-        );
-        let Some(crop) = crop else { return };
-        if let Some(id) = ocr::submit(crop) {
-            self.ocr_pending = Some(id);
-            self.ocr_ran = true;
-            ctx.request_repaint();
-        }
+        self.show_ocr = true;
+        self.start_shot(ShotJob::OcrInk, ctx);
     }
 
     /// 轮询 OCR 结果:文本行 → 序号圆标(逻辑坐标);失败按"缺模型只提示一次"处理
@@ -2665,12 +2646,21 @@ impl App {
         match done.result {
             Ok(lines) => {
                 let ppp = ctx.pixels_per_point();
+                // 行矩形在提交图(选区裁剪)内的物理像素坐标 → 换算逻辑坐标并加选区原点,
+                // 徽章才能落在选框内的标注上(无选区时原点为 0)
+                let origin = self
+                    .region_sel
+                    .map(|s| Rect::from_two_pos(s.start, s.cur).min)
+                    .unwrap_or(Pos2::ZERO);
                 self.ocr_badges = lines
                     .iter()
                     .map(|l| {
                         (
                             Rect::from_min_size(
-                                Pos2::new(l.rect[0] as f32 / ppp, l.rect[1] as f32 / ppp),
+                                Pos2::new(
+                                    origin.x + l.rect[0] as f32 / ppp,
+                                    origin.y + l.rect[1] as f32 / ppp,
+                                ),
                                 Vec2::new(l.rect[2] as f32 / ppp, l.rect[3] as f32 / ppp),
                             ),
                             l.no,
@@ -2678,26 +2668,12 @@ impl App {
                     })
                     .collect();
                 self.ocr_lines = lines;
-                // 保存早于识别完成:回写那一行
-                if let Some(row) = self.ocr_pending_row.take() {
-                    let text = self
-                        .ocr_lines
-                        .iter()
-                        .map(|l| l.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let json = ocr::lines_to_json(&self.ocr_lines);
-                    let _ = gallery::update_ocr(row, &text, &json, "done");
-                }
                 if self.ocr_lines.is_empty() {
                     self.set_toast(Ok(tr.ocr_none.to_string()));
                 }
             }
             Err(e) => {
                 self.ocr_failed = true;
-                if let Some(row) = self.ocr_pending_row.take() {
-                    let _ = gallery::update_ocr(row, "", "[]", "failed");
-                }
                 match e {
                     OcrError::ModelMissing => {
                         if !self.ocr_missing_notified {
@@ -2980,7 +2956,12 @@ impl App {
         self.shot_job = None;
         let had_region = self.region_sel.is_some();
         let result = self.compose_and_dispatch(ctx, job, overlay, had_region);
-        self.set_toast(result);
+        // OCR 标注识别成功时不弹 toast(结果窗已有"正在识别"反馈),失败才提示
+        match result {
+            Err(e) => self.set_toast(Err(e)),
+            Ok(msg) if job != ShotJob::OcrInk => self.set_toast(Ok(msg)),
+            Ok(_) => {}
+        }
     }
 
     fn compose_and_dispatch(
@@ -3004,6 +2985,52 @@ impl App {
             })
         };
         let tr = self.lang.strings();
+        let (ow, oh) = (overlay.size[0], overlay.size[1]);
+        // OCR 标注识别:捕获帧只渲染了墨迹,铺白底后(可选裁选区)直接交给 OCR 线程
+        if job == ShotJob::OcrInk {
+            let mut rgba = vec![255u8; ow * oh * 4];
+            flatten_over(&mut rgba, &overlay, 0, 0, ow, oh);
+            let mut shot =
+                capture::Shot { width: ow as i32, height: oh as i32, rgba };
+            if let Some((x, y, w, h)) = crop {
+                if let Some(c) = capture::crop_shot(&shot, x, y, w, h) {
+                    shot = c;
+                }
+            }
+            // 诊断:GEOM_LOG 开启时把喂给 OCR 的图落盘,排查捕获帧内容
+            if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+                if let Some(dir) = std::env::var_os("TEMP") {
+                    let mut img = shot.rgba.clone();
+                    for px in img.chunks_exact_mut(4) {
+                        let (r, g, b) = (px[0], px[1], px[2]);
+                        px[0] = b;
+                        px[1] = g;
+                        px[2] = r;
+                    }
+                    if let Some(img) =
+                        image::RgbaImage::from_raw(shot.width as u32, shot.height as u32, img)
+                    {
+                        let p = std::path::PathBuf::from(dir).join("ptf-ocr-capture.png");
+                        let _ = image::save_buffer(
+                            &p,
+                            img.as_raw(),
+                            shot.width as u32,
+                            shot.height as u32,
+                            image::ColorType::Rgba8,
+                        );
+                        eprintln!("[ocr] capture dumped to {}", p.display());
+                    }
+                }
+            }
+            return match ocr::submit(shot) {
+                Some(id) => {
+                    self.ocr_pending = Some(id);
+                    ctx.request_repaint();
+                    Ok(String::new()) // 结果窗显示"正在识别",不弹 toast
+                }
+                None => Err(i18n::fill(tr.ocr_failed, &["提交识别任务失败"])),
+            };
+        }
         // 1) 桌面底图(只抓需要的区域;crop 是窗口内坐标,截屏要换成桌面坐标)
         //    无选区 = 只抓当前这块显示器(覆盖层窗口的范围),不碰其他屏幕
         let (mx, my, mw, mh) = self.screen;
@@ -3014,29 +3041,12 @@ impl App {
         let bw = base.width as usize;
         let bh = base.height as usize;
         // 2) 覆盖层合成(Color32 为预乘 alpha:out = src + dst*(1-a));区域任务仅遍历区域像素
-        let (ow, oh) = (overlay.size[0], overlay.size[1]);
         let (ox, oy) = match crop {
             Some((x, y, _, _)) => (x as usize, y as usize),
             None => (0, 0),
         };
         let mut rgba = base.rgba;
-        let cw = bw.min(ow.saturating_sub(ox));
-        let ch = bh.min(oh.saturating_sub(oy));
-        for y in 0..ch {
-            for x in 0..cw {
-                let p = overlay.pixels[(oy + y) * ow + (ox + x)];
-                let a = p.a() as u32;
-                if a == 0 {
-                    continue;
-                }
-                let inv = 255 - a;
-                let i = (y * bw + x) * 4;
-                rgba[i] = (p.r() as u32 + (rgba[i] as u32 * inv) / 255) as u8;
-                rgba[i + 1] = (p.g() as u32 + (rgba[i + 1] as u32 * inv) / 255) as u8;
-                rgba[i + 2] = (p.b() as u32 + (rgba[i + 2] as u32 * inv) / 255) as u8;
-                rgba[i + 3] = 255;
-            }
-        }
+        flatten_over(&mut rgba, &overlay, ox, oy, bw, bh);
         let shot = capture::Shot {
             width: bw as i32,
             height: bh as i32,
@@ -3049,7 +3059,7 @@ impl App {
                 let (path, size, hash) = save_shot_image(&shot, self.shot)?;
                 // 画廊入库:缩略图 + 内容指纹 + 来源软件 + OCR 文本
                 // (DB 失败只记日志,保存本身已成功,不影响用户)
-                self.insert_gallery_row(&shot, &path, size, &hash, had_region);
+                self.insert_gallery_row(&shot, &path, size, &hash);
                 let detail = format!("{} ({})", path.display(), human_size(size));
                 Ok(i18n::fill(tr.saved_tip, &[&detail]))
             }
@@ -3066,6 +3076,7 @@ impl App {
                     .map_err(|e| e.to_string())?;
                 Ok(format!("{prefix}{}", tr.copied_tip))
             }
+            ShotJob::OcrInk => unreachable!("OcrInk 已在上方提交 OCR"),
         }
     }
 
@@ -3077,7 +3088,6 @@ impl App {
         path: &std::path::Path,
         size: u64,
         hash: &str,
-        had_region: bool,
     ) {
         let thumb = gallery::thumbnail_png(shot, 320).ok().and_then(|bytes| {
             let tdir = path.parent()?.join("thumbs");
@@ -3099,15 +3109,12 @@ impl App {
             .map(|l| l.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        // 状态:无选区=off;OCR 还在跑=pending(结果回来后回写);失败=failed;其余=done
-        let status = if !had_region || !self.ocr_ran {
-            "off"
-        } else if self.ocr_pending.is_some() {
-            "pending"
-        } else if self.ocr_failed {
-            "failed"
-        } else {
+        // 状态:会话里有 OCR 结果(先手动识别再保存)=done;否则 off
+        // (OCR 改为手动触发后,存图时刻不再有"识别进行中",无需回写)
+        let status = if self.ocr_pending.is_none() && !self.ocr_lines.is_empty() {
             "done"
+        } else {
+            "off"
         };
         let row = gallery::NewShot {
             created_at: now_ms(),
@@ -3124,11 +3131,7 @@ impl App {
             ocr_status: status,
         };
         match gallery::insert(row) {
-            Ok(id) => {
-                if status == "pending" {
-                    self.ocr_pending_row = Some(id);
-                }
-            }
+            Ok(_id) => {}
             Err(e) => eprintln!("[gallery] 入库失败: {e}"),
         }
     }
@@ -3161,7 +3164,7 @@ impl App {
         });
     }
 
-    /// 持久化界面状态(位置 / 调试模式 / 语言 / 存图格式与清晰度 / 去背方式 / OCR 开关)
+    /// 持久化界面状态(位置 / 调试模式 / 语言 / 存图格式与清晰度 / 去背方式)
     fn save_state(&self) {
         save_ui_state(
             self.standby_px,
@@ -3172,7 +3175,6 @@ impl App {
             self.bg_method,
             self.dark_light,
             &self.signature,
-            self.ocr_auto,
         );
     }
 
@@ -3208,6 +3210,29 @@ fn bg_issue_text(tr: &i18n::Strings, issue: Option<&BgIssue>) -> String {
 }
 
 /// OCR 序号圆标:橙色实心圆 + 白字,中心放在文本框左上角(画进导出图)
+/// 预乘 alpha 合成(Color32 语义:out = src + dst*(1-a)),把 overlay 帧缓冲
+/// 按 (ox,oy) 偏移原地铺到 base 上;base 尺寸 bw×bh,overlay 越界部分裁掉
+fn flatten_over(base: &mut [u8], overlay: &ColorImage, ox: usize, oy: usize, bw: usize, bh: usize) {
+    let (ow, oh) = (overlay.size[0], overlay.size[1]);
+    let cw = bw.min(ow.saturating_sub(ox));
+    let ch = bh.min(oh.saturating_sub(oy));
+    for y in 0..ch {
+        for x in 0..cw {
+            let p = overlay.pixels[(oy + y) * ow + (ox + x)];
+            let a = p.a() as u32;
+            if a == 0 {
+                continue;
+            }
+            let inv = 255 - a;
+            let i = (y * bw + x) * 4;
+            base[i] = (p.r() as u32 + (base[i] as u32 * inv) / 255) as u8;
+            base[i + 1] = (p.g() as u32 + (base[i + 1] as u32 * inv) / 255) as u8;
+            base[i + 2] = (p.b() as u32 + (base[i + 2] as u32 * inv) / 255) as u8;
+            base[i + 3] = 255;
+        }
+    }
+}
+
 fn draw_badges(p: &egui::Painter, badges: &[(Rect, u32)]) {
     for (r, no) in badges {
         let c = Pos2::new(r.left(), r.top());
@@ -3371,7 +3396,6 @@ fn load_ui_state() -> (
     BgMethod,
     bool,
     String,
-    bool,
 ) {
     let mut standby = None;
     let mut toolbar = None;
@@ -3381,7 +3405,6 @@ fn load_ui_state() -> (
     let mut bg_method = BgMethod::default();
     let mut dark_light = true;
     let mut signature = String::new();
-    let mut ocr_auto = true;
     if let Ok(text) = std::fs::read_to_string(ui_state_path()) {
         // 用记事本/PowerShell 改过这个文件时可能带 UTF-8 BOM,会让第一行的键名匹配失败
         for line in text.trim_start_matches('\u{feff}').lines() {
@@ -3411,8 +3434,6 @@ fn load_ui_state() -> (
                 }
             } else if line == "dark_light=0" {
                 dark_light = false;
-            } else if line == "ocr_auto=0" {
-                ocr_auto = false;
             } else if let Some(v) = line.strip_prefix("signature=") {
                 // 签名整行取值(可含空格);换行符是 TextEdit 不该出现的脏数据,忽略
                 signature = v.trim_end().trim_start().to_string();
@@ -3428,7 +3449,6 @@ fn load_ui_state() -> (
         bg_method,
         dark_light,
         signature,
-        ocr_auto,
     )
 }
 
@@ -3441,7 +3461,6 @@ fn save_ui_state(
     bg_method: BgMethod,
     dark_light: bool,
     signature: &str,
-    ocr_auto: bool,
 ) {
     let path = ui_state_path();
     if let Some(dir) = path.parent() {
@@ -3466,9 +3485,6 @@ fn save_ui_state(
     text.push_str(&format!("bg_method={}\n", bg_method.code()));
     if !dark_light {
         text.push_str("dark_light=0\n");
-    }
-    if !ocr_auto {
-        text.push_str("ocr_auto=0\n");
     }
     if !signature.is_empty() {
         // 签名放最后一行整行存:内容可含空格,不参与键值冲突
@@ -3654,8 +3670,16 @@ impl eframe::App for App {
         // 截图/去背帧:隐藏界面元素;去背期间额外隐藏标注层(图层隔离,标注不进背景处理)
         let debaking = self.debak_started.is_some();
         self.shot_skip_ink = debaking;
-        self.shot_skip_chrome =
-            (self.shot_phase == ShotPhase::NeedFrame && !self.debug_shot) || debaking;
+        // 捕获任务从发起到帧缓冲回调落地可能跨越多帧,且真正被截图的帧
+        // 未必是旗标按 NeedFrame 生效的那帧(实测品红探针:命令发出后的
+        // 下一帧才被捕获)——所以 chrome 的隐藏以"任务进行中"为准,
+        // 覆盖整个任务生命周期,debug 模式除外(本来就要拍进界面)。
+        // 这同时修掉了 Save/Copy 捕获帧漏进工具条的老问题。
+        let capture_pending = self.shot_job.is_some() && self.shot_phase != ShotPhase::Idle;
+        self.shot_skip_chrome = (capture_pending && !self.debug_shot) || debaking;
+        // OCR 标注捕获:底图与去背白底都算"截图内容",捕获帧一并隐藏,只留墨迹
+        self.shot_skip_backdrop =
+            self.shot_job == Some(ShotJob::OcrInk) && self.shot_phase != ShotPhase::Idle;
         self.poll_shot(&ctx);
         self.poll_bg_job(&ctx);
         self.poll_ocr_job(&ctx);
@@ -3671,21 +3695,32 @@ impl eframe::App for App {
         if !self.shot_skip_chrome {
             self.toast_ui(&ctx);
         }
-        // 本帧渲染完后再请求帧缓冲截图(eFrame 在本帧绘制末端读像素,含透明通道)
+        // 本帧渲染完后再请求帧缓冲截图(eFrame 在本帧绘制末端读像素,含透明通道)。
+        // 注意:任务是在本帧的 UI 里发起的,本帧开头的旗标还是旧的——底图会露出来;
+        // 等旗标生效的那一帧(skip_backdrop=true)再请求。chrome 已按"任务进行中"
+        // 全程隐藏,无论捕获落在哪一帧都不会带界面;debug 模式除外。
         if self.shot_phase == ShotPhase::NeedFrame {
             if let Some(job) = self.shot_job {
-                let slot = self.shot_slot.clone();
-                let ctx2 = ctx.clone();
-                ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::ScreenshotCallback::new(
-                    move |image| {
-                        if let Ok(mut s) = slot.lock() {
-                            *s = Some((job, image));
-                        }
-                        ctx2.request_repaint();
-                    },
-                )));
-                self.shot_phase = ShotPhase::Sent;
-                self.shot_sent_wait = 0;
+                // 旗标生效判定:任务首个完整帧起 skip_chrome 为真(Save/Copy/OcrInk 通用),
+                // OcrInk 的底图旗标(skip_backdrop)同帧生效,无需单独判
+                let flags_ready = self.debug_shot || self.shot_skip_chrome;
+                if flags_ready {
+                    let slot = self.shot_slot.clone();
+                    let ctx2 = ctx.clone();
+                    ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::ScreenshotCallback::new(
+                        move |image| {
+                            if let Ok(mut s) = slot.lock() {
+                                *s = Some((job, image));
+                            }
+                            ctx2.request_repaint();
+                        },
+                    )));
+                    self.shot_phase = ShotPhase::Sent;
+                    self.shot_sent_wait = 0;
+                } else {
+                    // 旗标尚未生效:再来一帧
+                    ctx.request_repaint();
+                }
             } else {
                 self.shot_phase = ShotPhase::Idle;
             }
