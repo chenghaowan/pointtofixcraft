@@ -478,6 +478,7 @@ impl GalleryUi {
             .pivot(Align2::CENTER_CENTER)
             .default_pos(screen_center)
             .default_size(Vec2::new(820.0, 560.0))
+            .min_size(Vec2::new(640.0, 540.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
@@ -513,183 +514,190 @@ impl GalleryUi {
                     return;
                 }
 
-                let left_w = THUMB_W + 24.0;
-                ui.horizontal(|ui| {
-                    // ---- 左栏:缩略图网格 ----
-                    ui.vertical(|ui| {
-                        ui.set_width(left_w);
-                        egui::ScrollArea::vertical()
-                            .id_salt("gallery-list")
-                            .show(ui, |ui| {
-                                let cols = 2usize;
-                                egui::Grid::new("gallery-grid")
-                                    .num_columns(cols as usize)
-                                    .spacing([6.0, 6.0])
-                                    .show(ui, |ui| {
-                                        for (i, row) in self.items.clone().iter().enumerate() {
-                                            self.load_thumb(ctx, row);
-                                            let tex = self.thumbs.get(&row.id);
-                                            let (rect, resp) = ui.allocate_exact_size(
-                                                Vec2::new(THUMB_W, THUMB_H + 16.0),
-                                                egui::Sense::click(),
-                                            );
-                                            let p = ui.painter();
-                                            let img_rect =
-                                                Rect::from_min_size(rect.min, Vec2::new(THUMB_W, THUMB_H));
-                                            let selected = self.selected == Some(row.id);
-                                            p.rect_filled(
-                                                rect,
-                                                4.0,
-                                                if selected {
-                                                    Color32::from_rgb(144, 202, 249)
-                                                } else if resp.hovered() {
-                                                    Color32::from_rgb(224, 231, 240)
-                                                } else {
-                                                    Color32::from_rgb(250, 250, 250)
-                                                },
-                                            );
-                                            match (tex, row.file.is_file()) {
-                                                (Some(t), _) => {
-                                                    p.image(
-                                                        t.id(),
-                                                        fit_rect(t.size_vec2(), img_rect),
-                                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                                        Color32::WHITE,
-                                                    );
-                                                }
-                                                (None, true) => {
-                                                    p.text(
-                                                        img_rect.center(),
-                                                        Align2::CENTER_CENTER,
-                                                        "…",
-                                                        FontId::proportional(14.0),
-                                                        Color32::GRAY,
-                                                    );
-                                                }
-                                                (None, false) => {
-                                                    p.text(
-                                                        img_rect.center(),
-                                                        Align2::CENTER_CENTER,
-                                                        "✕",
-                                                        FontId::proportional(14.0),
-                                                        Color32::GRAY,
-                                                    );
-                                                }
-                                            }
-                                            let caption = format!(
-                                                "{} {}",
-                                                &format_local_ms(row.created_at)[5..16],
-                                                row.app_name.as_deref().unwrap_or("")
-                                            );
-                                            p.text(
-                                                Pos2::new(rect.min.x + 2.0, img_rect.bottom() + 2.0),
-                                                Align2::LEFT_TOP,
-                                                caption,
-                                                FontId::proportional(9.5),
-                                                Color32::from_rgb(90, 90, 90),
-                                            );
-                                            if resp.clicked() {
-                                                self.selected = Some(row.id);
-                                            }
-                                            if (i + 1) % cols == 0 {
-                                                ui.end_row();
-                                            }
-                                        }
-                                    });
-                            });
-                    });
-                    ui.separator();
+                // ---- 流行布局:上面主画,下面缩略图条(filmstrip)----
+                let visuals = ui.visuals().clone();
+                let total = ui.available_size();
+                let strip_h = THUMB_H + 16.0 + 8.0; // 缩略图 + 日期行 + 余量
+                let ocr_h = (total.y * 0.22).clamp(70.0, 120.0);
+                let reserved = strip_h + ocr_h + 88.0; // 元数据行 + 按钮行 + 分隔线/间距
+                let preview_h = (total.y - reserved).max(180.0);
 
-                    // ---- 右栏:大图 + 元数据 + OCR + 按钮 ----
-                    let right_w = ui.available_width();
-                    ui.vertical(|ui| {
-                        ui.set_width(right_w.max(300.0));
-                        let Some(row) = self
-                            .selected
-                            .and_then(|id| self.items.iter().find(|r| r.id == id).cloned())
-                        else {
-                            return;
-                        };
-                        self.load_preview(ctx, &row);
-                        // 大图预览(按可用空间等比缩放)
-                        let preview_max = Vec2::new(right_w - 8.0, 300.0);
-                        let pre_rect = ui.allocate_exact_size(preview_max, egui::Sense::hover()).0;
-                        match &self.preview {
-                            Some((id, tex)) if *id == row.id => {
-                                let p = ui.painter_at(pre_rect);
-                                p.image(
-                                    tex.id(),
-                                    fit_rect(tex.size_vec2(), pre_rect),
-                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
-                                );
-                            }
-                            _ => {
-                                ui.painter_at(pre_rect).text(
-                                    pre_rect.center(),
-                                    Align2::CENTER_CENTER,
-                                    if row.file.is_file() { "…" } else { tr.gallery_missing_file },
-                                    FontId::proportional(13.0),
-                                    Color32::GRAY,
-                                );
+                let Some(row) = self
+                    .selected
+                    .and_then(|id| self.items.iter().find(|r| r.id == id).cloned())
+                else {
+                    return;
+                };
+                self.load_preview(ctx, &row);
+
+                // ---- 主画:占满剩余高度,等比缩放居中 ----
+                let pv_rect = ui
+                    .allocate_exact_size(
+                        Vec2::new(ui.available_width(), preview_h),
+                        egui::Sense::hover(),
+                    )
+                    .0;
+                {
+                    let p = ui.painter_at(pv_rect);
+                    p.rect_filled(pv_rect, 6.0, visuals.extreme_bg_color);
+                    match &self.preview {
+                        Some((id, tex)) if *id == row.id => {
+                            p.image(
+                                tex.id(),
+                                fit_rect(tex.size_vec2(), pv_rect.shrink(4.0)),
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        _ => {
+                            p.text(
+                                pv_rect.center(),
+                                Align2::CENTER_CENTER,
+                                if row.file.is_file() { "…" } else { tr.gallery_missing_file },
+                                FontId::proportional(13.0),
+                                visuals.weak_text_color(),
+                            );
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+                let status_note = match row.ocr_status.as_str() {
+                    "done" => String::new(),
+                    other => format!(" · OCR:{other}"),
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {}×{} · {} · {}{}",
+                        format_local_ms(row.created_at),
+                        row.width,
+                        row.height,
+                        row.format,
+                        human_size(row.file_size as u64),
+                        status_note
+                    ))
+                    .weak()
+                    .small(),
+                );
+                // ---- 带序号 OCR 文本 ----
+                egui::ScrollArea::vertical()
+                    .id_salt("gallery-ocr")
+                    .max_height(ocr_h)
+                    .show(ui, |ui| {
+                        if row.ocr_lines.is_empty() {
+                            ui.label(egui::RichText::new(tr.gallery_no_ocr).weak());
+                        } else {
+                            for l in &row.ocr_lines {
+                                ui.label(format!("{} {}", circled(l.no), l.text));
                             }
                         }
-                        ui.add_space(2.0);
-                        let status_note = match row.ocr_status.as_str() {
-                            "done" => String::new(),
-                            other => format!(" · OCR:{other}"),
-                        };
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {}×{} · {} · {}{}",
-                                format_local_ms(row.created_at),
-                                row.width,
-                                row.height,
-                                row.format,
-                                human_size(row.file_size as u64),
-                                status_note
-                            ))
-                            .weak()
-                            .small(),
-                        );
-                        ui.separator();
-                        // 带序号 OCR 文本
-                        egui::ScrollArea::vertical()
-                            .id_salt("gallery-ocr")
-                            .max_height(110.0)
-                            .show(ui, |ui| {
-                                if row.ocr_lines.is_empty() {
-                                    ui.label(egui::RichText::new(tr.gallery_no_ocr).weak());
-                                } else {
-                                    for l in &row.ocr_lines {
-                                        ui.label(format!("{} {}", circled(l.no), l.text));
+                    });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if ui.button(tr.gallery_copy_image).clicked() {
+                        toast = Some(copy_image(&row.file).map(|_| tr.copied_tip.to_string()));
+                    }
+                    if ui.button(tr.gallery_copy_text).clicked() {
+                        let text = numbered_text(&row);
+                        toast = Some(clipboard_text(&text).map(|_| tr.ocr_copied.to_string()));
+                    }
+                    if ui.button(tr.gallery_open_folder).clicked() {
+                        let _ = std::process::Command::new("explorer")
+                            .arg(format!("/select,{}", row.file.display()))
+                            .spawn();
+                    }
+                    if ui
+                        .button(egui::RichText::new(tr.gallery_delete).color(Color32::from_rgb(183, 28, 28)))
+                        .clicked()
+                    {
+                        toast = Some(delete_shot(&row).map(|_| tr.gallery_deleted.to_string()));
+                        self.reload();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.separator();
+
+                // ---- 缩略图条:底部横向滚动 ----
+                egui::ScrollArea::horizontal()
+                    .id_salt("gallery-strip")
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for row in self.items.clone().iter() {
+                                self.load_thumb(ctx, row);
+                                let tex = self.thumbs.get(&row.id);
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    Vec2::new(THUMB_W, THUMB_H + 14.0),
+                                    egui::Sense::click(),
+                                );
+                                let img_rect =
+                                    Rect::from_min_size(rect.min, Vec2::new(THUMB_W, THUMB_H));
+                                let selected = self.selected == Some(row.id);
+                                let p = ui.painter();
+                                p.rect_filled(
+                                    img_rect,
+                                    4.0,
+                                    if selected {
+                                        visuals.selection.stroke.color
+                                    } else if resp.hovered() {
+                                        visuals.widgets.hovered.bg_fill
+                                    } else {
+                                        visuals.extreme_bg_color
+                                    },
+                                );
+                                match (tex, row.file.is_file()) {
+                                    (Some(t), _) => {
+                                        // 选中时内缩 2px,留出选色环
+                                        p.image(
+                                            t.id(),
+                                            fit_rect(
+                                                t.size_vec2(),
+                                                if selected {
+                                                    img_rect.shrink(2.0)
+                                                } else {
+                                                    img_rect
+                                                },
+                                            ),
+                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                            Color32::WHITE,
+                                        );
+                                    }
+                                    (None, true) => {
+                                        p.text(
+                                            img_rect.center(),
+                                            Align2::CENTER_CENTER,
+                                            "…",
+                                            FontId::proportional(14.0),
+                                            Color32::GRAY,
+                                        );
+                                    }
+                                    (None, false) => {
+                                        p.text(
+                                            img_rect.center(),
+                                            Align2::CENTER_CENTER,
+                                            "✕",
+                                            FontId::proportional(14.0),
+                                            Color32::GRAY,
+                                        );
                                     }
                                 }
-                            });
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.button(tr.gallery_copy_image).clicked() {
-                                toast = Some(copy_image(&row.file).map(|_| tr.copied_tip.to_string()));
-                            }
-                            if ui.button(tr.gallery_copy_text).clicked() {
-                                let text = numbered_text(&row);
-                                toast = Some(clipboard_text(&text).map(|_| tr.ocr_copied.to_string()));
-                            }
-                            if ui.button(tr.gallery_open_folder).clicked() {
-                                let _ = std::process::Command::new("explorer")
-                                    .arg(format!("/select,{}", row.file.display()))
-                                    .spawn();
-                            }
-                            if ui
-                                .button(egui::RichText::new(tr.gallery_delete).color(Color32::from_rgb(183, 28, 28)))
-                                .clicked()
-                            {
-                                toast = Some(delete_shot(&row).map(|_| tr.gallery_deleted.to_string()));
-                                self.reload();
+                                let caption = format!(
+                                    "{} {}",
+                                    &format_local_ms(row.created_at)[5..16],
+                                    row.app_name.as_deref().unwrap_or("")
+                                );
+                                p.text(
+                                    Pos2::new(rect.min.x + 2.0, img_rect.bottom() + 2.0),
+                                    Align2::LEFT_TOP,
+                                    caption,
+                                    FontId::proportional(9.5),
+                                    visuals.weak_text_color(),
+                                );
+                                if resp.clicked() {
+                                    self.selected = Some(row.id);
+                                }
                             }
                         });
                     });
-                });
             });
         if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
             if let Some(r) = &win {
