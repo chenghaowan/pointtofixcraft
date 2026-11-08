@@ -366,6 +366,8 @@ pub struct GalleryUi {
     thumbs: HashMap<i64, TextureHandle>,
     thumb_order: Vec<i64>,
     preview: Option<(i64, TextureHandle)>,
+    /// show() 检测到 × 关闭后置位,由调用方 take_closed() 收口
+    just_closed: bool,
 }
 
 impl Default for GalleryUi {
@@ -379,6 +381,7 @@ impl Default for GalleryUi {
             thumbs: HashMap::new(),
             thumb_order: Vec::new(),
             preview: None,
+            just_closed: false,
         }
     }
 }
@@ -467,8 +470,8 @@ impl GalleryUi {
         let mut search_changed = false;
         let screen_center = ctx.input(|i| i.raw.screen_rect).map(|r| r.center()).unwrap_or(Pos2::ZERO);
 
-        egui::Window::new(tr.gallery_title)
-            .id(Id::unique("gallery"))
+        let win = egui::Window::new(tr.gallery_title)
+            .id(Id::new("gallery"))
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -688,11 +691,22 @@ impl GalleryUi {
                     });
                 });
             });
+        if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+            if let Some(r) = &win {
+                eprintln!("[gallery] win_rect={:?}", r.response.rect);
+            }
+        }
         if !open {
             self.loaded = false; // 下次打开重新加载
+            self.just_closed = true;
             return None;
         }
         toast
+    }
+
+    /// × 关闭信号(读后即清)。此前 open=false 被丢弃,画廊的 × 实际关不掉。
+    pub fn take_closed(&mut self) -> bool {
+        std::mem::take(&mut self.just_closed)
     }
 }
 
