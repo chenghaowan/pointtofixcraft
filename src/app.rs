@@ -1018,7 +1018,29 @@ impl App {
         // 工具热键(文字编辑时不触发):Ctrl+R 框选 / Ctrl+M 放大镜 / Ctrl+I 设置
         // Ctrl+S 保存 / Ctrl+C 复制(有选区时只作用于选区)
         // 必须用 Ctrl 组合键:中文 IME 开启时裸字母键会被输入法组合输入吃掉
-        if !editing {
+        //
+        // 文字编辑与热键的两条放行通道(否则"刚写完字 Ctrl+C"会失效):
+        // 1. 编辑器有内容且组词已结束时,Ctrl+C = 提交文字并复制——打完字直接复制;
+        // 2. 空编辑器(写完字点画布提交后,文字工具会立刻自动重开一个)不能吞热键,
+        //    出现 Ctrl 组合键或复制事件就先丢弃它;空编辑器提交本来就是空操作。
+        let ghost_edit = self
+            .text_edit
+            .as_ref()
+            .is_some_and(|te| te.buf.is_empty() && te.preedit.is_none());
+        if editing && !ghost_edit {
+            let editing_copy = ctx.input(|i| {
+                i.events.iter().any(|e| matches!(e, egui::Event::Copy))
+                    && self
+                        .text_edit
+                        .as_ref()
+                        .is_some_and(|te| !te.buf.is_empty() && te.preedit.is_none())
+            });
+            if editing_copy {
+                self.commit_text_edit();
+                self.do_copy(ctx);
+            }
+        }
+        if !editing || ghost_edit {
             let mut save_now = false;
             let mut copy_now = false;
             let mut undo_now = false;
@@ -1045,13 +1067,22 @@ impl App {
                     }
                 }
                 // Ctrl+C / Ctrl+X 会被 egui-winit 转成 Copy/Cut 事件,不再有 Key::C;
-                // 所以复制快捷键必须同时看 Event::Copy(文本编辑时整个热键块会被跳过)
+                // 所以复制快捷键必须同时看 Event::Copy(非空编辑器在上方已单独放行)
                 let copy_event = i
                     .events
                     .iter()
                     .any(|e| matches!(e, egui::Event::Copy));
                 if copy_event {
                     copy_now = true;
+                }
+                // 幽灵空编辑器:出现 Ctrl 组合键或复制事件就先丢弃,再照常执行热键
+                if ghost_edit {
+                    let ctrl_key = i.events.iter().any(|e| {
+                        matches!(e, egui::Event::Key { pressed: true, modifiers, .. } if modifiers.ctrl)
+                    });
+                    if copy_event || ctrl_key {
+                        self.text_edit = None;
+                    }
                 }
                 if !i.modifiers.ctrl {
                     return;
