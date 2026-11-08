@@ -248,10 +248,8 @@ pub struct App {
     // ---------- 画廊 ----------
     show_gallery: bool,
     gallery: gallery::GalleryUi,
-    /// 画廊从待机面板打开:原生窗口已临时放大,关闭时要还原小面板
-    gallery_from_standby: bool,
-    /// 放大命令跨帧生效的等待帧数(归零强制显示,防窗口尺寸异常时永远开不出)
-    gallery_grace_frames: u32,
+    /// 主画双击的全屏查看(独立视口,开启时主窗口输入全让位)
+    viewer_open: bool,
     /// 进入标注那一刻的来源软件标题(画廊 app_name 列,RAG 的"来源"维度)
     source_app: Option<String>,
     /// 进入标注时冻结的原始屏幕画面(OCR 直接从内存裁选区,不再抓屏)
@@ -379,8 +377,7 @@ impl App {
             hidden: false,
             show_gallery: false,
             gallery: gallery::GalleryUi::default(),
-            gallery_from_standby: false,
-            gallery_grace_frames: 0,
+            viewer_open: false,
             source_app: None,
             backdrop_shot: None,
             ocr_pending: None,
@@ -534,31 +531,6 @@ impl App {
         )
     }
 
-    /// 待机面板直接打开画廊:原生窗口临时放大到画廊尺寸、居中到面板所在显示器,
-    /// 关闭画廊时还原(见 gallery_ui)。画廊是本视口里的 egui 窗口,
-    /// 不放大原生窗口会被 132×134 的小面板裁掉。
-    /// 注意 show_gallery 不在这里置位:InnerSize 跨帧才生效,画廊必须等
-    /// 视口真的变大后再生成,否则窗口尺寸/位置会被小视口钳坏并固化
-    /// (实测生成在 (0,0)-(646,449))。
-    fn open_gallery_from_standby(&mut self, ctx: &Context) {
-        self.gallery_from_standby = true;
-        self.gallery_grace_frames = 30;
-        let ppp = ctx.pixels_per_point();
-        let size = Vec2::new(840.0, 600.0);
-        let panel_px = self.standby_px.unwrap_or_else(|| self.default_standby_px(ppp));
-        let panel_c = Pos2::new(
-            panel_px.x + STANDBY_SIZE.x * ppp / 2.0,
-            panel_px.y + STANDBY_SIZE.y * ppp / 2.0,
-        );
-        let p = Pos2::new(
-            panel_c.x - size.x * ppp / 2.0,
-            panel_c.y - size.y * ppp / 2.0,
-        );
-        let p = self.snap_px_to_monitor(p, Vec2::new(size.x * ppp, size.y * ppp));
-        ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
-        self.move_window_px(ctx, p);
-    }
-
     /// 跟随显示器变化(热插拔 / 改分辨率 / 改缩放):
     /// 待机时刷新显示器列表(面板吸附用);标注时按锁定的显示器重新取矩形并铺满
     /// (DPI 变化时 winit 会按逻辑尺寸缩放窗口,必须再按物理像素铺一次)
@@ -602,6 +574,9 @@ impl App {
     /// 从屏幕上抹掉,立刻 BitBlt 抓到的画面里还会留着面板残影。
     fn begin_enter_active(&mut self, ctx: &Context) {
         self.region_zoom = 1.0;
+        // 进入标注:关掉待机打开的画廊/全屏查看视口(独立视口随 show_gallery 消亡)
+        self.show_gallery = false;
+        self.viewer_open = false;
         // 只标注「开始标注」按钮所在的那块显示器。按钮在待机面板上,
         // 用面板中心的物理坐标找显示器;拿不到就退鼠标位置,再退主屏。
         let ppp = ctx.pixels_per_point();
@@ -754,11 +729,6 @@ impl App {
 
     fn standby_ui(&mut self, ctx: &Context, ui: &mut egui::Ui) {
         let tr = self.lang.strings();
-        // 画廊从待机打开期间:原生窗口已临时放大,小面板不绘制
-        //(半透明底会铺满整个大窗口,画廊下面垫一块灰很丑)
-        if self.gallery_from_standby {
-            return;
-        }
         egui::CentralPanel::default()
             .frame(
                 Frame::NONE
@@ -837,7 +807,7 @@ impl App {
                         .on_hover_cursor(egui::CursorIcon::Default)
                         .clicked()
                     {
-                        self.open_gallery_from_standby(ctx);
+                        self.show_gallery = true;
                     }
                 });
             });
@@ -861,6 +831,11 @@ impl App {
 
     fn active_ui(&mut self, ctx: &Context) {
         let tr = self.lang.strings();
+        // 画廊全屏查看打开时输入全归查看器(Esc/点击由 gallery_ui 关闭),
+        // 不能让画布/热键/Esc 退出链同时响应
+        if self.viewer_open {
+            return;
+        }
         // 文字编辑:先处理本帧的字符/输入法/退格/回车事件,再响应鼠标点击
         // (点击任意处都会提交;文字工具点到画布会在下方 begin_stroke 重新开编)
         if self.text_edit.is_some() {
@@ -2861,30 +2836,98 @@ impl App {
         }
     }
 
-    /// 画廊窗口(打开期间每帧调用;操作产生的 toast 由这里转发)
+    /// 画廊(打开期间每帧调用;操作产生的 toast 由这里转发)。
+    /// 待机路径用独立原生视口:主窗口不做程序化 move+resize——winit 会被
+    /// 搞得把窗口 scale 报成 2.0(实测),egui 以 2× 渲染进一半大小的窗口,
+    /// 整体错位;独立视口按创建时的显示器 scale 建窗,天然正确。
+    /// 标注模式视口本就全屏,沿用 egui::Window 浮窗。
     fn gallery_ui(&mut self, ctx: &Context) {
         if !self.show_gallery {
             return;
         }
         let tr = self.lang.strings();
+        if self.mode == Mode::Standby {
+            let (mx, my, mw, mh) = self.gallery_host_monitor(ctx);
+            let ppp = ctx.pixels_per_point();
+            if self.viewer_open {
+                // 全屏查看视口:Esc/点击在视口内部关闭
+                let mut close = false;
+                ctx.show_viewport_immediate(
+                    egui::ViewportId(egui::Id::unique("gallery-viewer")),
+                    egui::ViewportBuilder::default()
+                        .with_title(tr.gallery_title)
+                        .with_decorations(false)
+                        .with_window_level(egui::WindowLevel::AlwaysOnTop)
+                        .with_position(Pos2::new(mx as f32 / ppp, my as f32 / ppp))
+                        .with_inner_size(Vec2::new(mw as f32 / ppp, mh as f32 / ppp)),
+                    |ui, _class| {
+                        close = self.gallery.viewer_ui(ui, tr);
+                    },
+                );
+                if close {
+                    self.viewer_open = false;
+                }
+                return;
+            }
+            // 画廊视口:居中到所在显示器(面板在角落,一般不会盖住)
+            let gw = 840.0_f32.min(mw as f32 / ppp);
+            let gh = 600.0_f32.min(mh as f32 / ppp);
+            let pos = Pos2::new(
+                mx as f32 / ppp + (mw as f32 / ppp - gw) / 2.0,
+                my as f32 / ppp + (mh as f32 / ppp - gh) / 2.0,
+            );
+            ctx.show_viewport_immediate(
+                egui::ViewportId(egui::Id::unique("gallery-standby")),
+                egui::ViewportBuilder::default()
+                    .with_title(tr.gallery_title)
+                    .with_decorations(false)
+                    .with_window_level(egui::WindowLevel::AlwaysOnTop)
+                    .with_position(pos)
+                    .with_inner_size(Vec2::new(gw, gh)),
+                |ui, _class| {
+                    self.gallery.show_standby(ui, tr);
+                },
+            );
+            if self.gallery.take_want_viewer() {
+                self.viewer_open = true;
+            }
+            // × 关闭:egui Window 的 open 信号曾被丢弃,统一在这里收口
+            if self.gallery.take_closed() {
+                self.show_gallery = false;
+            }
+            return;
+        }
+        // 标注模式
+        if self.viewer_open {
+            return; // 查看视口开着,主窗口输入全让位
+        }
         if let Some(result) = self.gallery.show(ctx, tr) {
             self.set_toast(result);
         }
-        // × 关闭:egui Window 的 open 信号此前被丢弃,画廊的 × 实际关不掉;统一在这里收口
         if self.gallery.take_closed() {
             self.show_gallery = false;
-            if self.gallery_from_standby {
-                self.gallery_from_standby = false;
-                // 还原待机小面板的尺寸与位置(打开期间位置跟踪已跳过,不会记到大窗口)
-                let ppp = ctx.pixels_per_point();
-                let pos_px = self.clamp_standby_px(
-                    self.standby_px.unwrap_or_else(|| self.default_standby_px(ppp)),
-                    ppp,
-                );
-                self.move_window_px(ctx, pos_px);
-                ctx.send_viewport_cmd(ViewportCommand::InnerSize(STANDBY_SIZE));
-            }
         }
+    }
+
+    /// 画廊/查看视口摆放的显示器:待机面板所在显示器
+    fn gallery_host_monitor(&self, ctx: &Context) -> (i32, i32, i32, i32) {
+        let ppp = ctx.pixels_per_point();
+        let panel_px = self.standby_px.unwrap_or_else(|| self.default_standby_px(ppp));
+        let c = Pos2::new(
+            panel_px.x + STANDBY_SIZE.x * ppp / 2.0,
+            panel_px.y + STANDBY_SIZE.y * ppp / 2.0,
+        );
+        self.monitors
+            .iter()
+            .copied()
+            .find(|&(mx, my, mw, mh)| {
+                c.x >= mx as f32
+                    && c.x < (mx + mw) as f32
+                    && c.y >= my as f32
+                    && c.y < (my + mh) as f32
+            })
+            .or_else(|| self.monitors.first().copied())
+            .unwrap_or((0, 0, 1280, 800))
     }
 
     /// OCR 结果窗口:当前截图的带序号文本行 + 复制全部
@@ -3789,20 +3832,8 @@ impl eframe::App for App {
             Mode::Standby => self.standby_ui(&ctx, ui),
             Mode::Active => self.active_ui(&ctx),
         }
-        // 画廊待机模式也能开(原生窗口由 open_gallery_from_standby 临时放大);
-        // 放大到位(egui screen_rect 跟上目标尺寸)后才生成画廊窗口,帧数兜底防卡死
+        // 画廊待机模式也能开(独立原生视口,见 gallery_ui)
         if !self.shot_skip_chrome {
-            if self.gallery_from_standby && !self.show_gallery {
-                let target = Vec2::new(840.0, 600.0);
-                let sr = ctx
-                    .input(|i| i.raw.screen_rect.unwrap_or(Rect::ZERO).size());
-                let ready = sr.x >= target.x - 2.0 && sr.y >= target.y - 2.0;
-                if ready || self.gallery_grace_frames == 0 {
-                    self.show_gallery = true;
-                } else {
-                    self.gallery_grace_frames -= 1;
-                }
-            }
             self.gallery_ui(&ctx);
         }
         if self.mode == Mode::Active && !self.shot_skip_chrome {

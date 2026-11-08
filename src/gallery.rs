@@ -10,8 +10,9 @@
 //! - 字段契约见 docs/db-schema.md:`id` 是外部接入的稳定外键,
 //!   `file_path` 相对 gallery 根目录(整目录可搬家)。
 //!
-//! UI:左栏 = 搜索框 + 缩略图网格(懒加载 + LRU 纹理缓存),
-//! 右栏 = 大图预览 + 元数据 + 带序号 OCR 文本 + 操作按钮。
+//! UI:顶部搜索栏;主画预览 + 元数据 + 带序号 OCR + 操作按钮;底部横向
+//! 缩略图条(懒加载 + LRU 纹理缓存)。双击主画全屏查看;待机打开时
+//! 原生窗口是临时放大的载体,顶部拖动条走 OS 级拖动(可拖出视口边界)。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -368,6 +369,8 @@ pub struct GalleryUi {
     preview: Option<(i64, TextureHandle)>,
     /// show() 检测到 × 关闭后置位,由调用方 take_closed() 收口
     just_closed: bool,
+    /// 主画被双击,请求进入全屏查看(调用方 take_want_viewer 后接管)
+    want_viewer: bool,
 }
 
 impl Default for GalleryUi {
@@ -382,6 +385,7 @@ impl Default for GalleryUi {
             thumb_order: Vec::new(),
             preview: None,
             just_closed: false,
+            want_viewer: false,
         }
     }
 }
@@ -460,18 +464,17 @@ impl GalleryUi {
         self.items.len()
     }
 
-    /// 打开窗口期间每帧调用;返回 toast
+    /// 标注模式:egui::Window 浮窗。视口本就全屏、原点 (0,0),浮窗定位一直正常。
     pub fn show(&mut self, ctx: &egui::Context, tr: &Strings) -> Option<Result<String, String>> {
         if !self.loaded {
             self.reload();
         }
         let mut open = true;
         let mut toast: Option<Result<String, String>> = None;
-        let mut search_changed = false;
         let screen_center = ctx.input(|i| i.raw.screen_rect).map(|r| r.center()).unwrap_or(Pos2::ZERO);
 
         let win = egui::Window::new(tr.gallery_title)
-            .id(Id::new("gallery"))
+            .id(Id::unique("gallery"))
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
@@ -480,228 +483,27 @@ impl GalleryUi {
             .default_size(Vec2::new(820.0, 560.0))
             .min_size(Vec2::new(640.0, 540.0))
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text(tr.gallery_search_hint)
-                            .desired_width(280.0),
-                    );
-                    if ui.button("🔍").clicked() {
-                        search_changed = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(crate::i18n::fill(
-                            tr.gallery_count,
-                            &[&self.items.len().to_string()],
-                        ));
-                    });
-                });
-                if search_changed {
-                    self.reload();
-                }
-                ui.add_space(4.0);
-                if let Some(err) = &self.load_error {
-                    ui.label(egui::RichText::new(format!("DB: {err}")).color(Color32::RED));
-                    return;
-                }
-                if self.items.is_empty() {
-                    ui.add_space(20.0);
-                    ui.label(if self.search.is_empty() {
-                        tr.gallery_empty
-                    } else {
-                        tr.gallery_no_result
-                    });
-                    return;
-                }
-
-                // ---- 流行布局:上面主画,下面缩略图条(filmstrip)----
-                let visuals = ui.visuals().clone();
-                let total = ui.available_size();
-                let strip_h = THUMB_H + 16.0 + 8.0; // 缩略图 + 日期行 + 余量
-                let ocr_h = (total.y * 0.22).clamp(70.0, 120.0);
-                let reserved = strip_h + ocr_h + 88.0; // 元数据行 + 按钮行 + 分隔线/间距
-                let preview_h = (total.y - reserved).max(180.0);
-
-                let Some(row) = self
-                    .selected
-                    .and_then(|id| self.items.iter().find(|r| r.id == id).cloned())
-                else {
-                    return;
-                };
-                self.load_preview(ctx, &row);
-
-                // ---- 主画:占满剩余高度,等比缩放居中 ----
-                let pv_rect = ui
-                    .allocate_exact_size(
-                        Vec2::new(ui.available_width(), preview_h),
-                        egui::Sense::hover(),
-                    )
-                    .0;
-                {
-                    let p = ui.painter_at(pv_rect);
-                    p.rect_filled(pv_rect, 6.0, visuals.extreme_bg_color);
-                    match &self.preview {
-                        Some((id, tex)) if *id == row.id => {
-                            p.image(
-                                tex.id(),
-                                fit_rect(tex.size_vec2(), pv_rect.shrink(4.0)),
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                        }
-                        _ => {
-                            p.text(
-                                pv_rect.center(),
-                                Align2::CENTER_CENTER,
-                                if row.file.is_file() { "…" } else { tr.gallery_missing_file },
-                                FontId::proportional(13.0),
-                                visuals.weak_text_color(),
-                            );
-                        }
-                    }
-                }
-                ui.add_space(4.0);
-                let status_note = match row.ocr_status.as_str() {
-                    "done" => String::new(),
-                    other => format!(" · OCR:{other}"),
-                };
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}×{} · {} · {}{}",
-                        format_local_ms(row.created_at),
-                        row.width,
-                        row.height,
-                        row.format,
-                        human_size(row.file_size as u64),
-                        status_note
-                    ))
-                    .weak()
-                    .small(),
-                );
-                // ---- 带序号 OCR 文本 ----
-                egui::ScrollArea::vertical()
-                    .id_salt("gallery-ocr")
-                    .max_height(ocr_h)
-                    .show(ui, |ui| {
-                        if row.ocr_lines.is_empty() {
-                            ui.label(egui::RichText::new(tr.gallery_no_ocr).weak());
-                        } else {
-                            for l in &row.ocr_lines {
-                                ui.label(format!("{} {}", circled(l.no), l.text));
-                            }
-                        }
-                    });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    if ui.button(tr.gallery_copy_image).clicked() {
-                        toast = Some(copy_image(&row.file).map(|_| tr.copied_tip.to_string()));
-                    }
-                    if ui.button(tr.gallery_copy_text).clicked() {
-                        let text = numbered_text(&row);
-                        toast = Some(clipboard_text(&text).map(|_| tr.ocr_copied.to_string()));
-                    }
-                    if ui.button(tr.gallery_open_folder).clicked() {
-                        let _ = std::process::Command::new("explorer")
-                            .arg(format!("/select,{}", row.file.display()))
-                            .spawn();
-                    }
-                    if ui
-                        .button(egui::RichText::new(tr.gallery_delete).color(Color32::from_rgb(183, 28, 28)))
-                        .clicked()
-                    {
-                        toast = Some(delete_shot(&row).map(|_| tr.gallery_deleted.to_string()));
-                        self.reload();
-                    }
-                });
-                ui.add_space(4.0);
-                ui.separator();
-
-                // ---- 缩略图条:底部横向滚动 ----
-                egui::ScrollArea::horizontal()
-                    .id_salt("gallery-strip")
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for row in self.items.clone().iter() {
-                                self.load_thumb(ctx, row);
-                                let tex = self.thumbs.get(&row.id);
-                                let (rect, resp) = ui.allocate_exact_size(
-                                    Vec2::new(THUMB_W, THUMB_H + 14.0),
-                                    egui::Sense::click(),
-                                );
-                                let img_rect =
-                                    Rect::from_min_size(rect.min, Vec2::new(THUMB_W, THUMB_H));
-                                let selected = self.selected == Some(row.id);
-                                let p = ui.painter();
-                                p.rect_filled(
-                                    img_rect,
-                                    4.0,
-                                    if selected {
-                                        visuals.selection.stroke.color
-                                    } else if resp.hovered() {
-                                        visuals.widgets.hovered.bg_fill
-                                    } else {
-                                        visuals.extreme_bg_color
-                                    },
-                                );
-                                match (tex, row.file.is_file()) {
-                                    (Some(t), _) => {
-                                        // 选中时内缩 2px,留出选色环
-                                        p.image(
-                                            t.id(),
-                                            fit_rect(
-                                                t.size_vec2(),
-                                                if selected {
-                                                    img_rect.shrink(2.0)
-                                                } else {
-                                                    img_rect
-                                                },
-                                            ),
-                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                            Color32::WHITE,
-                                        );
-                                    }
-                                    (None, true) => {
-                                        p.text(
-                                            img_rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            "…",
-                                            FontId::proportional(14.0),
-                                            Color32::GRAY,
-                                        );
-                                    }
-                                    (None, false) => {
-                                        p.text(
-                                            img_rect.center(),
-                                            Align2::CENTER_CENTER,
-                                            "✕",
-                                            FontId::proportional(14.0),
-                                            Color32::GRAY,
-                                        );
-                                    }
-                                }
-                                let caption = format!(
-                                    "{} {}",
-                                    &format_local_ms(row.created_at)[5..16],
-                                    row.app_name.as_deref().unwrap_or("")
-                                );
-                                p.text(
-                                    Pos2::new(rect.min.x + 2.0, img_rect.bottom() + 2.0),
-                                    Align2::LEFT_TOP,
-                                    caption,
-                                    FontId::proportional(9.5),
-                                    visuals.weak_text_color(),
-                                );
-                                if resp.clicked() {
-                                    self.selected = Some(row.id);
-                                }
-                            }
-                        });
-                    });
+                toast = self.body(ctx, ui, tr);
             });
         if std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
             if let Some(r) = &win {
-                eprintln!("[gallery] win_rect={:?}", r.response.rect);
+                let (sr, or, npp, mon) = ctx.input(|i| {
+                    (
+                        i.raw.screen_rect,
+                        i.viewport().outer_rect,
+                        i.viewport().native_pixels_per_point,
+                        i.viewport().monitor_size,
+                    )
+                });
+                eprintln!(
+                    "[gallery] win_rect={:?} screen={:?} outer={:?} native_ppp={:?} monitor={:?} egui_ppp={}",
+                    r.response.rect,
+                    sr,
+                    or,
+                    npp,
+                    mon,
+                    ctx.pixels_per_point()
+                );
             }
         }
         if !open {
@@ -712,9 +514,385 @@ impl GalleryUi {
         toast
     }
 
+    /// 待机路径:渲染进独立原生视口(viewport)。主窗口不做程序化 move+resize
+    /// ——那会把 winit 的窗口 scale 搞成 2.0,绘制整体翻倍错位;独立视口按
+    /// 创建时的显示器 scale 建窗,天然正确。自绘标题栏=拖动把手+×,Esc 也关闭。
+    pub fn show_standby(&mut self, ui: &mut egui::Ui, tr: &Strings) -> Option<Result<String, String>> {
+        if !self.loaded {
+            self.reload();
+        }
+        let ctx = ui.ctx().clone();
+        // Esc 关闭(视口持有焦点时事件走这里)
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.just_closed = true;
+        }
+        let mut toast: Option<Result<String, String>> = None;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(ui.visuals().window_fill()))
+            .show(ui, |ui| {
+                // ---- 自绘标题栏:拖动把手 + × ----
+                // 拖动用 OuterPosition 增量而不是 OS 级 StartDrag:egui-winit 只在
+                // 窗口持有焦点时才执行 drag_window(),视口刚弹出/失焦时会静默失效。
+                ui.horizontal(|ui| {
+                    let w = ui.available_width();
+                    let (grip_rect, grip) =
+                        ui.allocate_exact_size(egui::vec2(w - 34.0, 28.0), egui::Sense::drag());
+                    if grip.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if grip.dragged() {
+                        if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+                            let d = ctx.input(|i| i.pointer.delta());
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                                outer.min + d,
+                            ));
+                        }
+                    }
+                    ui.painter().text(
+                        Pos2::new(grip_rect.left() + 10.0, grip_rect.center().y),
+                        Align2::LEFT_CENTER,
+                        tr.gallery_title,
+                        FontId::proportional(15.0),
+                        ui.visuals().text_color(),
+                    );
+                    if ui
+                        .add_sized(
+                            [30.0, 26.0],
+                            egui::Button::new(egui::RichText::new("×").size(15.0)),
+                        )
+                        .clicked()
+                    {
+                        self.just_closed = true;
+                    }
+                });
+                ui.add_space(2.0);
+                toast = self.body(&ctx, ui, tr);
+            });
+        toast
+    }
+
+    /// 搜索栏 + 主画 + 元数据 + OCR + 按钮 + 缩略图条(egui::Window 与待机全视口共用)
+    fn body(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, tr: &Strings) -> Option<Result<String, String>> {
+        let mut toast: Option<Result<String, String>> = None;
+        let mut search_changed = false;
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text(tr.gallery_search_hint)
+                    .desired_width(280.0),
+            );
+            if ui.button("🔍").clicked() {
+                search_changed = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(crate::i18n::fill(
+                    tr.gallery_count,
+                    &[&self.items.len().to_string()],
+                ));
+            });
+        });
+        if search_changed {
+            self.reload();
+        }
+        ui.add_space(4.0);
+        if let Some(err) = &self.load_error {
+            ui.label(egui::RichText::new(format!("DB: {err}")).color(Color32::RED));
+            return None;
+        }
+        if self.items.is_empty() {
+            ui.add_space(20.0);
+            ui.label(if self.search.is_empty() {
+                tr.gallery_empty
+            } else {
+                tr.gallery_no_result
+            });
+            return None;
+        }
+
+        // ---- 流行布局:上面主画,下面缩略图条(filmstrip)----
+        let visuals = ui.visuals().clone();
+        let total = ui.available_size();
+        let strip_h = THUMB_H + 16.0 + 8.0; // 缩略图 + 日期行 + 余量
+        let ocr_h = (total.y * 0.22).clamp(70.0, 120.0);
+        let reserved = strip_h + ocr_h + 88.0; // 元数据行 + 按钮行 + 分隔线/间距
+        let preview_h = (total.y - reserved).max(180.0);
+
+        let Some(row) = self
+            .selected
+            .and_then(|id| self.items.iter().find(|r| r.id == id).cloned())
+        else {
+            return None;
+        };
+        self.load_preview(ctx, &row);
+
+        // ---- 主画:占满剩余高度,等比缩放居中;双击进入全屏查看 ----
+        let (pv_rect, pv_resp) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), preview_h),
+            egui::Sense::click(),
+        );
+        {
+            let p = ui.painter_at(pv_rect);
+            p.rect_filled(pv_rect, 6.0, visuals.extreme_bg_color);
+            match &self.preview {
+                Some((id, tex)) if *id == row.id => {
+                    p.image(
+                        tex.id(),
+                        fit_rect(tex.size_vec2(), pv_rect.shrink(4.0)),
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                }
+                _ => {
+                    p.text(
+                        pv_rect.center(),
+                        Align2::CENTER_CENTER,
+                        if row.file.is_file() { "…" } else { tr.gallery_missing_file },
+                        FontId::proportional(13.0),
+                        visuals.weak_text_color(),
+                    );
+                }
+            }
+        }
+        if pv_resp.double_clicked() {
+            self.want_viewer = true;
+        }
+        ui.add_space(4.0);
+        let status_note = match row.ocr_status.as_str() {
+            "done" => String::new(),
+            other => format!(" · OCR:{other}"),
+        };
+        ui.label(
+            egui::RichText::new(format!(
+                "{} · {}×{} · {} · {}{}",
+                format_local_ms(row.created_at),
+                row.width,
+                row.height,
+                row.format,
+                human_size(row.file_size as u64),
+                status_note
+            ))
+            .weak()
+            .small(),
+        );
+        // ---- 带序号 OCR 文本 ----
+        egui::ScrollArea::vertical()
+            .id_salt("gallery-ocr")
+            .max_height(ocr_h)
+            .show(ui, |ui| {
+                if row.ocr_lines.is_empty() {
+                    ui.label(egui::RichText::new(tr.gallery_no_ocr).weak());
+                } else {
+                    for l in &row.ocr_lines {
+                        ui.label(format!("{} {}", circled(l.no), l.text));
+                    }
+                }
+            });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui.button(tr.gallery_copy_image).clicked() {
+                toast = Some(copy_image(&row.file).map(|_| tr.copied_tip.to_string()));
+            }
+            if ui.button(tr.gallery_copy_text).clicked() {
+                let text = numbered_text(&row);
+                toast = Some(clipboard_text(&text).map(|_| tr.ocr_copied.to_string()));
+            }
+            if ui.button(tr.gallery_open_folder).clicked() {
+                let _ = std::process::Command::new("explorer")
+                    .arg(format!("/select,{}", row.file.display()))
+                    .spawn();
+            }
+            if ui
+                .button(egui::RichText::new(tr.gallery_delete).color(Color32::from_rgb(183, 28, 28)))
+                .clicked()
+            {
+                toast = Some(delete_shot(&row).map(|_| tr.gallery_deleted.to_string()));
+                self.reload();
+            }
+        });
+        ui.add_space(4.0);
+        ui.separator();
+
+        // ---- 缩略图条:底部横向滚动 ----
+        egui::ScrollArea::horizontal()
+            .id_salt("gallery-strip")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (ti, row) in self.items.clone().iter().enumerate() {
+                        self.load_thumb(ctx, row);
+                        let tex = self.thumbs.get(&row.id);
+                        let (rect, resp) = ui.allocate_exact_size(
+                            Vec2::new(THUMB_W, THUMB_H + 14.0),
+                            egui::Sense::click(),
+                        );
+                        let img_rect =
+                            Rect::from_min_size(rect.min, Vec2::new(THUMB_W, THUMB_H));
+                        let selected = self.selected == Some(row.id);
+                        let p = ui.painter();
+                        p.rect_filled(
+                            img_rect,
+                            4.0,
+                            if selected {
+                                visuals.selection.stroke.color
+                            } else if resp.hovered() {
+                                visuals.widgets.hovered.bg_fill
+                            } else {
+                                visuals.extreme_bg_color
+                            },
+                        );
+                        match (tex, row.file.is_file()) {
+                            (Some(t), _) => {
+                                // 选中时内缩 2px,留出选色环
+                                p.image(
+                                    t.id(),
+                                    fit_rect(
+                                        t.size_vec2(),
+                                        if selected {
+                                            img_rect.shrink(2.0)
+                                        } else {
+                                            img_rect
+                                        },
+                                    ),
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
+                                );
+                            }
+                            (None, true) => {
+                                p.text(
+                                    img_rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    "…",
+                                    FontId::proportional(14.0),
+                                    Color32::GRAY,
+                                );
+                            }
+                            (None, false) => {
+                                p.text(
+                                    img_rect.center(),
+                                    Align2::CENTER_CENTER,
+                                    "✕",
+                                    FontId::proportional(14.0),
+                                    Color32::GRAY,
+                                );
+                            }
+                        }
+                        let caption = format!(
+                            "{} {}",
+                            &format_local_ms(row.created_at)[5..16],
+                            row.app_name.as_deref().unwrap_or("")
+                        );
+                        p.text(
+                            Pos2::new(rect.min.x + 2.0, img_rect.bottom() + 2.0),
+                            Align2::LEFT_TOP,
+                            caption,
+                            FontId::proportional(9.5),
+                            visuals.weak_text_color(),
+                        );
+                        // 悬停快捷删除:右上角 ✕。悬停判定用指针包含(手动),
+                        // 不依赖 egui 的 hover 优先级——叠放在 allocate 出的
+                        // tile 上的小 interact 实测拿不到 hovered。
+                        let pointer_pos = ctx.input(|i| i.pointer.latest_pos());
+                        let hovering = pointer_pos.is_some_and(|pp| rect.contains(pp));
+                        if ti == 0 && std::env::var("POINTTOFIX_GEOM_LOG").is_ok() {
+                            eprintln!(
+                                "[gallery] tile0 rect={rect:?} pointer={pointer_pos:?} hovering={hovering}"
+                            );
+                        }
+                        let del_rect = Rect::from_min_size(
+                            img_rect.right_top() - Vec2::new(18.0, 0.0),
+                            Vec2::new(18.0, 18.0),
+                        );
+                        let del_resp = ui.interact(
+                            del_rect,
+                            Id::unique(("gal-del", row.id)),
+                            egui::Sense::click(),
+                        );
+                        if hovering {
+                            p.rect_filled(
+                                del_rect,
+                                4.0,
+                                Color32::from_rgba_unmultiplied(178, 34, 34, 225),
+                            );
+                            p.text(
+                                del_rect.center(),
+                                Align2::CENTER_CENTER,
+                                "✕",
+                                FontId::proportional(11.0),
+                                Color32::WHITE,
+                            );
+                        }
+                        if del_resp.clicked() {
+                            toast = Some(
+                                delete_shot(row).map(|_| tr.gallery_deleted.to_string()),
+                            );
+                            self.reload();
+                        }
+                        if resp.clicked() {
+                            self.selected = Some(row.id);
+                        }
+                    }
+                });
+            });
+        toast
+    }
+
     /// × 关闭信号(读后即清)。此前 open=false 被丢弃,画廊的 × 实际关不掉。
     pub fn take_closed(&mut self) -> bool {
         std::mem::take(&mut self.just_closed)
+    }
+
+    /// 主画双击请求(读后即清)
+    pub fn take_want_viewer(&mut self) -> bool {
+        std::mem::take(&mut self.want_viewer)
+    }
+
+    /// 全屏查看当前选中截图:黑底等比铺满所在视口(渲染进独立查看视口)。
+    /// Esc 或点击返回 true——视口的创建/销毁由调用方负责。
+    pub fn viewer_ui(&mut self, ui: &mut egui::Ui, tr: &Strings) -> bool {
+        let ctx = ui.ctx().clone();
+        let Some(row) = self
+            .selected
+            .and_then(|id| self.items.iter().find(|r| r.id == id).cloned())
+        else {
+            return true;
+        };
+        self.load_preview(&ctx, &row);
+        let sr = ctx.input(|i| i.raw.screen_rect).unwrap_or(Rect::ZERO);
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            Id::unique("gallery-viewer"),
+        ));
+        painter.rect_filled(sr, 0.0, Color32::BLACK);
+        match &self.preview {
+            Some((id, tex)) if *id == row.id => {
+                painter.image(
+                    tex.id(),
+                    fit_rect(tex.size_vec2(), sr.shrink(24.0)),
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            }
+            _ => {
+                painter.text(
+                    sr.center(),
+                    Align2::CENTER_CENTER,
+                    if row.file.is_file() { "…" } else { tr.gallery_missing_file },
+                    FontId::proportional(16.0),
+                    Color32::GRAY,
+                );
+            }
+        }
+        painter.text(
+            Pos2::new(sr.left() + 12.0, sr.bottom() - 24.0),
+            Align2::LEFT_CENTER,
+            tr.gallery_viewer_hint,
+            FontId::proportional(12.0),
+            Color32::GRAY,
+        );
+        let clicked = ctx.input(|i| i.pointer.primary_clicked());
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        esc || clicked
     }
 }
 
